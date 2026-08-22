@@ -1,7 +1,7 @@
 'use client';
 /* eslint-disable @next/next/no-img-element -- vinext client rendering is incompatible with next/image here. */
 
-import { useEffect, useMemo, useState } from 'react';
+import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import { changeTitles, copy, fieldMeanings, moduleNames, type Locale } from './i18n';
 
 type Field = { id:string; code:string; tableName:string; columnName:string; dataType:string; businessMeaning:string; firstVersion:string; currentVersion:string; moduleSlug:string; moduleName:string; moduleKind:'core'|'feature'; projectCodes:string|null };
@@ -37,8 +37,16 @@ export default function Home() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all'|'core'|'feature'>('all');
   const [selectedCode, setSelectedCode] = useState('CUS-003');
+  const [modal, setModal] = useState<'field'|'change'|null>(null);
   const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState(false);
   const t = copy[locale];
+
+  const load = async () => {
+    const response = await fetch('/api/registry');
+    if (!response.ok) throw new Error('registry_unavailable');
+    setData(await response.json() as RegistryData);
+  };
 
   useEffect(() => {
     const saved = window.localStorage.getItem('drifty-locale');
@@ -63,7 +71,7 @@ export default function Home() {
   useEffect(() => {
     const onKey = (event:KeyboardEvent) => {
       if (event.key === '/' && document.activeElement?.tagName !== 'INPUT') { event.preventDefault(); document.getElementById('registry-search')?.focus(); }
-      if (event.key === 'Escape') setNotice('');
+      if (event.key === 'Escape') { setModal(null); setNotice(''); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -84,6 +92,25 @@ export default function Home() {
     setLocale(next); window.localStorage.setItem('drifty-locale', next); document.documentElement.lang = next === 'zh' ? 'zh-CN' : 'en';
   };
 
+  const submit = async (event:FormEvent<HTMLFormElement>, action:'field'|'change') => {
+    event.preventDefault();
+    setBusy(true);
+    setNotice('');
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    try {
+      const response = await fetch('/api/registry', { method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ action, [action]:values }) });
+      const result = await response.json() as { error?:string };
+      if (!response.ok) { setNotice(result.error ?? t.saveError); return; }
+      await load();
+      setModal(null);
+      setNotice(action === 'field' ? t.fieldAdded : t.changeAdded);
+    } catch {
+      setNotice(t.saveError);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const navItems = [
     ['overview','⌘',t.overview,null], ['registry','▦',t.registry,data.fields.length],
     ['changes','↗',t.changes,data.changes.length], ['projects','◇',t.projects,data.projects.length],
@@ -96,7 +123,8 @@ export default function Home() {
       <label className="search"><span aria-hidden="true">⌕</span><input id="registry-search" aria-label={t.search} placeholder={t.search} value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>/</kbd></label>
       <button className="quiet-button top-docs" type="button" onClick={() => navigate('projects')}>{t.manifests}</button>
       <button className="locale-button" type="button" aria-label={t.languageLabel} onClick={toggleLocale}>{t.language}</button>
-      <span className="readonly-badge"><i />{t.readOnly}</span>
+      <span className="sync-badge"><i />{t.cloudSync}</span>
+      <button className="primary-button" type="button" onClick={() => setModal('change')}>{t.newChange}</button>
     </header>
 
     <div className="workspace">
@@ -106,7 +134,7 @@ export default function Home() {
       </aside>
 
       <section className="content">
-        {notice && <div className="notice" role="status">{notice === 'fetch' ? t.fetchError : `${t.selectHint} ${selectedCode} · ${split(selected?.projectCodes ?? null).length} ${t.affected}`}<button aria-label={t.dismiss} onClick={() => setNotice('')}>×</button></div>}
+        {notice && <div className="notice" role="status">{notice === 'fetch' ? t.fetchError : notice === 'selected' ? `${t.selectHint} ${selectedCode} · ${split(selected?.projectCodes ?? null).length} ${t.affected}` : notice}<button aria-label={t.dismiss} onClick={() => setNotice('')}>×</button></div>}
 
         {view === 'overview' && <>
           <section className="brand-hero">
@@ -129,12 +157,12 @@ export default function Home() {
         </>}
 
         {view === 'registry' && <>
-          <PageHeading eyebrow={t.registryEyebrow} title={t.registryHeading} copy={t.registryCopy} />
+          <PageHeading eyebrow={t.registryEyebrow} title={t.registryHeading} copy={t.registryCopy}><button className="primary-button" onClick={() => setModal('field')}>{t.addField}</button></PageHeading>
           <section className="panel"><div className="panel-header"><div><h2>{t.allFields}</h2><p>{fields.length} / {data.fields.length} {t.records}</p></div></div><div className="filter-row">{(['all','core','feature'] as const).map((item) => <button key={item} className={`filter ${filter===item?'active':''}`} onClick={() => setFilter(item)}>{item === 'all' ? t.all : item === 'core' ? t.core : t.features}</button>)}</div><FieldTable fields={fields} locale={locale} onSelect={selectField}/></section>
         </>}
 
         {view === 'changes' && <>
-          <PageHeading eyebrow={t.changesEyebrow} title={t.changesHeading} copy={t.changesCopy} />
+          <PageHeading eyebrow={t.changesEyebrow} title={t.changesHeading} copy={t.changesCopy}><button className="primary-button" onClick={() => setModal('change')}>{t.newChange}</button></PageHeading>
           <div className="change-list">{data.changes.map((change) => <article className="panel change-row" key={change.changeCode}><div><span className={`risk-pill ${change.risk}`}>{riskLabel(locale, change.risk)}</span><strong>{change.changeCode}</strong><p>{changeTitles[locale][change.changeCode] ?? change.title}</p></div><div className="change-object"><code>{change.fieldPath}</code><small>{moduleNames[locale][data.fields.find((item)=>item.code===change.fieldCode)?.moduleSlug ?? ''] ?? change.moduleName} · {change.migrationVersion}</small></div><div className="mini-diff"><code>{change.fromValue}</code><span>→</span><code>{change.toValue}</code></div><div className="project-stack">{split(change.projectCodes).map((code) => <span key={code}>{code}</span>)}</div></article>)}</div>
         </>}
 
@@ -144,14 +172,20 @@ export default function Home() {
           <section className="panel module-table"><div className="panel-header"><div><h2>{t.capabilityModules}</h2><p>{t.ownership}</p></div></div><table><thead><tr><th>{t.module}</th><th>{t.kind}</th><th>{t.version}</th><th>{t.fieldsColumn}</th><th>{t.projectsColumn}</th></tr></thead><tbody>{data.modules.map((module) => <tr key={module.slug}><td><strong>{moduleNames[locale][module.slug] ?? module.name}</strong><span className="field-code">{module.slug}</span></td><td><span className={module.kind==='core'?'source core':'source'}>{module.kind==='core'?t.core:t.features}</span></td><td><code>{module.version}</code></td><td>{module.fieldCount}</td><td>{module.projectCount}</td></tr>)}</tbody></table></section>
         </>}
 
-        <p className="readonly-footnote"><span>i</span>{t.readonlyNote}</p>
       </section>
     </div>
+
+    {modal === 'field' && <Modal title={t.addFieldTitle} copy={t.addFieldCopy} closeLabel={t.close} onClose={() => setModal(null)}><form onSubmit={(event) => submit(event,'field')}><FormRow label={t.fieldCode}><input name="code" placeholder="CUS-006" required /></FormRow><div className="form-pair"><FormRow label={t.table}><input name="tableName" placeholder="customer" required /></FormRow><FormRow label={t.column}><input name="columnName" placeholder="segment" required /></FormRow></div><FormRow label={t.dataType}><input name="dataType" placeholder="varchar(40)" required /></FormRow><FormRow label={t.businessMeaning}><input name="businessMeaning" placeholder={locale === 'zh' ? '客户市场分组' : 'Customer market segment'} required /></FormRow><div className="form-pair"><FormRow label={t.ownerModule}><select name="moduleSlug" required>{data.modules.map((module) => <option key={module.slug} value={module.slug}>{moduleNames[locale][module.slug] ?? module.name}</option>)}</select></FormRow><FormRow label={t.firstVersion}><input name="version" defaultValue="1.0.0" required /></FormRow></div><FormActions busy={busy} cancel={t.cancel} saving={t.saving} save={t.saveRecord} onCancel={() => setModal(null)} /></form></Modal>}
+
+    {modal === 'change' && <Modal title={t.registerChangeTitle} copy={t.registerChangeCopy} closeLabel={t.close} onClose={() => setModal(null)}><form onSubmit={(event) => submit(event,'change')}><div className="form-pair"><FormRow label={t.changeCode}><input name="changeCode" placeholder="CR-2026-0183" required /></FormRow><FormRow label={t.migration}><input name="migrationVersion" placeholder="V003" required /></FormRow></div><FormRow label={t.schemaField}><select name="fieldCode" defaultValue={selected?.code}>{data.fields.map((field) => <option key={field.code} value={field.code}>{field.code} · {field.tableName}.{field.columnName}</option>)}</select></FormRow><FormRow label={t.summary}><input name="title" placeholder={locale === 'zh' ? '扩展客户等级字段长度' : 'Increase customer level length'} required /></FormRow><div className="form-pair"><FormRow label={t.from}><input name="fromValue" placeholder="varchar(20)" required /></FormRow><FormRow label={t.to}><input name="toValue" placeholder="varchar(50)" required /></FormRow></div><FormRow label={t.risk}><select name="risk" defaultValue="medium"><option value="low">{t.low}</option><option value="medium">{t.medium}</option><option value="high">{t.high}</option></select></FormRow><FormActions busy={busy} cancel={t.cancel} saving={t.saving} save={t.saveRecord} onCancel={() => setModal(null)} /></form></Modal>}
   </main>;
 }
 
-function PageHeading({ eyebrow,title,copy:description }:{eyebrow:string;title:string;copy:string}) { return <div className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div></div>; }
+function PageHeading({ eyebrow,title,copy:description,children }:{eyebrow:string;title:string;copy:string;children?:React.ReactNode}) { return <div className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{children && <div className="heading-actions">{children}</div>}</div>; }
 function ImpactCard({ field,change,locale,onOpen }:{field?:Field;change?:Change;locale:Locale;onOpen:()=>void}) { const t=copy[locale]; if(!field)return <section className="panel impact-card empty-state">{t.noMatches}</section>; const projects=split(field.projectCodes); return <section className="panel impact-card"><div className="panel-header"><div><p className="eyebrow">{t.impactPreview}</p><h2>{field.code}</h2></div><span className="risk-pill">{riskLabel(locale,change?.risk??'low')}</span></div><p className="object-name">{field.tableName}.{field.columnName}</p><div className="diff"><code>- {change?.fromValue??field.dataType}</code><code>+ {change?.toValue??field.dataType}</code></div><dl><div><dt>{t.module}</dt><dd>{moduleNames[locale][field.moduleSlug]??field.moduleName}</dd></div><div><dt>{t.version}</dt><dd>{field.currentVersion}</dd></div></dl><p className="small-label">{t.affectedProjects}</p><div className="affected">{projects.map((project)=><span key={project}>{project}<small>{t.included}</small></span>)}</div><button className="wide-button" onClick={onOpen}>{t.openImpact}<span>→</span></button></section>; }
 function RecentChanges({ changes,locale,onOpen }:{changes:Change[];locale:Locale;onOpen:()=>void}) { const t=copy[locale]; return <section className="panel activity-card"><div className="panel-header"><h2>{t.recentChanges}</h2><button className="link-button" onClick={onOpen}>{t.viewAll}</button></div><ol>{changes.map((change)=><li key={change.changeCode}><span className="activity-icon">↗</span><div><strong>{change.changeCode}</strong><p>{changeTitles[locale][change.changeCode]??change.title}</p><small>{split(change.projectCodes).length} {t.projectsColumn.toLowerCase()} · {statusLabel(locale,change.status)}</small></div></li>)}</ol></section>; }
+function Modal({title,copy:description,closeLabel,onClose,children}:{title:string;copy:string;closeLabel:string;onClose:()=>void;children:React.ReactNode}) { return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target===event.currentTarget&&onClose()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-header"><div><h2 id="modal-title">{title}</h2><p>{description}</p></div><button type="button" aria-label={closeLabel} onClick={onClose}>×</button></div>{children}</section></div>; }
+function FormRow({label,children}:{label:string;children:React.ReactNode}) { return <label className="form-row"><span>{label}</span>{children}</label>; }
+function FormActions({busy,cancel,saving,save,onCancel}:{busy:boolean;cancel:string;saving:string;save:string;onCancel:()=>void}) { return <div className="form-actions"><button type="button" className="quiet-button" onClick={onCancel}>{cancel}</button><button className="primary-button" disabled={busy}>{busy?saving:save}</button></div>; }
 function riskLabel(locale:Locale,value:string){const t=copy[locale];return value==='high'?t.high:value==='low'?t.low:t.medium;}
 function statusLabel(locale:Locale,value:string){const t=copy[locale];return value==='approved'?t.approved:value==='review'?t.review:t.draft;}
