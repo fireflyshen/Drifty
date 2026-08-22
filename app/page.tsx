@@ -1,7 +1,7 @@
 'use client';
+/* eslint-disable @next/next/no-img-element -- vinext client rendering is incompatible with next/image here. */
 
 import { useEffect, useMemo, useState } from 'react';
-import Image from 'next/image';
 import { changeTitles, copy, fieldMeanings, moduleNames, type Locale } from './i18n';
 
 type Field = { id:string; code:string; tableName:string; columnName:string; dataType:string; businessMeaning:string; firstVersion:string; currentVersion:string; moduleSlug:string; moduleName:string; moduleKind:'core'|'feature'; projectCodes:string|null };
@@ -110,7 +110,7 @@ export default function Home() {
 
         {view === 'overview' && <>
           <section className="brand-hero">
-            <Image src="/drifty-hero.png" alt={t.heroAlt} fill priority sizes="(max-width: 760px) 100vw, 1280px" />
+            <img src="/drifty-hero.png" alt={t.heroAlt} />
             <div className="brand-hero-shade" />
             <div className="brand-hero-copy"><p className="eyebrow">{t.heroEyebrow}</p><h1>{t.heroTitle}</h1><p>{t.heroCopy}</p><div><button className="hero-primary" onClick={() => navigate('registry')}>{t.browseRegistry}</button><button className="hero-secondary" onClick={() => navigate('projects')}>{t.viewManifests}</button></div></div>
           </section>
