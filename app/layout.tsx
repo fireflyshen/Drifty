@@ -3,8 +3,8 @@ import './globals.css';
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://drifty-schema.sure-charm-1845.chatgpt.site'),
-  title: 'Drifty · Schema registry',
-  description: 'Manage reusable database capabilities, project composition and schema changes.',
+  title: 'Drifty · 数据库模型注册表 / Schema Registry',
+  description: '管理可复用数据库能力、项目组成和结构变更。Manage reusable database capabilities, project composition and schema changes.',
   openGraph: {
     title: 'Drifty',
     description: 'Schema registry for database product lines',
@@ -19,5 +19,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>;
+  return <html lang="zh-CN"><body>{children}</body></html>;
 }
