@@ -1,5 +1,10 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import { Geist } from "next/font/google";
+import { cn } from "@/lib/utils";
+import { TooltipProvider } from '@/components/ui/tooltip';
+
+const geist = Geist({subsets:['latin'],variable:'--font-sans'});
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://drifty-schema.sure-charm-1845.chatgpt.site'),
@@ -7,17 +12,17 @@ export const metadata: Metadata = {
   description: '看清平台、项目、版本与环境之间的字段差异。See schema changes before they drift.',
   openGraph: {
     title: 'Drifty',
-    description: 'Schema changes, quietly in place.',
-    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Drifty · Schema changes, quietly in place.' }],
+    description: 'Schema, in sync.',
+    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Drifty · Schema, in sync.' }],
   },
   twitter: {
     card: 'summary_large_image',
     title: 'Drifty',
-    description: 'Schema changes, quietly in place.',
+    description: 'Schema, in sync.',
     images: ['/og.png'],
   },
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="zh-CN"><body>{children}</body></html>;
+  return <html lang="zh-CN" className={cn("font-sans", geist.variable)}><body><TooltipProvider>{children}</TooltipProvider></body></html>;
 }
