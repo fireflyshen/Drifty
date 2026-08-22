@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.SITE_URL ?? 'http://localhost:3000'),
+  metadataBase: new URL('https://drifty-schema.sure-charm-1845.chatgpt.site'),
   title: 'Drifty · Schema registry',
   description: 'Manage reusable database capabilities, project composition and schema changes.',
   openGraph: {
