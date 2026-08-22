@@ -3,17 +3,17 @@ import './globals.css';
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://drifty-schema.sure-charm-1845.chatgpt.site'),
-  title: 'Drifty · 数据库模型注册表 / Schema Registry',
-  description: '管理可复用数据库能力、项目组成和结构变更。Manage reusable database capabilities, project composition and schema changes.',
+  title: 'Drifty · 数据库结构流转',
+  description: '看清平台、项目、版本与环境之间的字段差异。See schema changes before they drift.',
   openGraph: {
     title: 'Drifty',
-    description: 'Schema registry for database product lines',
-    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Drifty schema registry' }],
+    description: 'Schema changes, quietly in place.',
+    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Drifty · Schema changes, quietly in place.' }],
   },
   twitter: {
     card: 'summary_large_image',
     title: 'Drifty',
-    description: 'Schema registry for database product lines',
+    description: 'Schema changes, quietly in place.',
     images: ['/og.png'],
   },
 };
