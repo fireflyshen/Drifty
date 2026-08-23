@@ -11,7 +11,9 @@
     "start": "vinext start",
     "test": "node --experimental-strip-types --test app/lib/mysql-parser.test.ts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:remote": "wrangler d1 migrations apply drifty --remote --config wrangler.production.jsonc",
+    "deploy:cloudflare": "npm run db:migrate:remote && wrangler deploy --config wrangler.production.jsonc"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",
