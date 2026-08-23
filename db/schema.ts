@@ -88,7 +88,7 @@ export const fieldScopes = sqliteTable('field_scopes', {
 
 export const importBatches = sqliteTable('import_batches', {
   id: text('id').primaryKey(), code: text('code').notNull().unique(), name: text('name').notNull(), sourceKind: text('source_kind').notNull(),
-  fileName: text('file_name'), fingerprint: text('fingerprint').notNull(), projectId: text('project_id').notNull().references(() => catalogProjects.id),
+  fileName: text('file_name'), fingerprint: text('fingerprint').notNull(), rawSql: text('raw_sql').notNull().default(''), projectId: text('project_id').notNull().references(() => catalogProjects.id),
   versionId: text('version_id').notNull().references(() => catalogVersions.id), moduleId: text('module_id').references(() => catalogModules.id),
   status: text('status').notNull().default('active'), addedCount: integer('added_count').notNull().default(0), duplicateCount: integer('duplicate_count').notNull().default(0),
   conflictCount: integer('conflict_count').notNull().default(0), createdAt: text('created_at').notNull(), revertedAt: text('reverted_at'),

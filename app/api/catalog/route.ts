@@ -38,9 +38,66 @@ async function runChunked(db:D1Database, statements:D1PreparedStatement[]) {
   for (let index = 0; index < statements.length; index += 50) await db.batch(statements.slice(index,index + 50));
 }
 
-export async function GET() {
+export async function GET(request:Request) {
   const db = await ensureDatabase();
-  const [projects,environments,versions,modules,tables,fields,scopes,imports,repositories] = await db.batch([
+  const url = new URL(request.url);
+  const mode = url.searchParams.get('mode') || 'base';
+
+  if (mode === 'search') {
+    const query=clean(url.searchParams.get('q')).toLowerCase();
+    if (!query) return Response.json({ fields:[],scopes:[],total:0 });
+    const where:string[]=[`(lower(f.code) LIKE ? OR lower(t.name || '.' || f.name) LIKE ? OR lower(f.comment) LIKE ? OR lower(t.comment) LIKE ?)`];
+    const bindings:unknown[]=[`%${query}%`,`%${query}%`,`%${query}%`,`%${query}%`];
+    const condition=where.join(' AND ');
+    const [fieldRows,totalRow]=await Promise.all([
+      db.prepare(`SELECT f.id,f.code,f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,f.source_kind AS sourceKind,
+        t.id AS tableId,t.name AS tableName,t.code AS tableCode,t.comment AS tableComment,m.name AS moduleName,
+        group_concat(DISTINCT p.name) AS projectNames,group_concat(DISTINCT e.name) AS environmentNames,count(DISTINCT fs.environment_id) AS scopeCount
+        FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id LEFT JOIN catalog_modules m ON m.id=t.module_id
+        LEFT JOIN field_scopes fs ON fs.field_id=f.id LEFT JOIN catalog_projects p ON p.id=fs.project_id LEFT JOIN catalog_environments e ON e.id=fs.environment_id
+        WHERE ${condition} GROUP BY f.id ORDER BY CASE WHEN lower(t.name || '.' || f.name)=? THEN 0 WHEN lower(f.code)=? THEN 1 ELSE 2 END,t.name,f.ordinal,f.name LIMIT 80`).bind(...bindings,` ${query}`.trim(),query).all(),
+      db.prepare(`SELECT count(*) AS count FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id WHERE ${condition}`).bind(...bindings).first<{count:number}>(),
+    ]);
+    const ids=fieldRows.results.map(row=>String((row as Record<string,unknown>).id));
+    const placeholders=ids.map(()=>'?').join(',');
+    const scopeRows=ids.length?await db.prepare(`SELECT field_id AS fieldId,project_id AS projectId,version_id AS versionId,environment_id AS environmentId,state,origin FROM field_scopes WHERE field_id IN (${placeholders})`).bind(...ids).all():{results:[]};
+    return Response.json({ fields:fieldRows.results,scopes:scopeRows.results,total:Number(totalRow?.count??0) });
+  }
+
+  if (mode === 'project') {
+    const projectId=clean(url.searchParams.get('projectId'));
+    const project=await db.prepare(`SELECT id,parent_id AS parentId FROM catalog_projects WHERE id=? AND archived=0`).bind(projectId).first<{id:string;parentId:string|null}>();
+    if (!project) return Response.json({ error:'项目不存在。' },{ status:404 });
+    const parentId=project.parentId||project.id;
+    const [differenceRows,historyRows]=await Promise.all([
+      db.prepare(`WITH expected AS (
+          SELECT DISTINCT field_id FROM field_scopes WHERE project_id=? OR project_id=?
+        ), version_envs AS (
+          SELECT v.id AS version_id,v.name AS version_name,e.id AS environment_id,e.name AS environment_name
+          FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id AND (e.version_id=v.id OR e.version_id IS NULL)
+          WHERE v.project_id=? AND e.archived=0
+        ), matrix AS (
+          SELECT ex.field_id,ve.version_id,ve.version_name,ve.environment_id,ve.environment_name,fs.field_id AS present
+          FROM expected ex CROSS JOIN version_envs ve
+          LEFT JOIN field_scopes fs ON fs.field_id=ex.field_id AND fs.project_id=? AND fs.version_id=ve.version_id AND fs.environment_id=ve.environment_id
+        )
+        SELECT f.id,f.code,f.name,f.data_type AS dataType,f.comment,t.name AS tableName,m.version_id AS versionId,m.version_name AS versionName,
+          count(*) AS totalCount,sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END) AS presentCount,
+          group_concat(CASE WHEN m.present IS NULL THEN m.environment_name END,'|||') AS missingEnvironments
+        FROM matrix m JOIN catalog_fields f ON f.id=m.field_id JOIN catalog_tables t ON t.id=f.table_id
+        GROUP BY f.id,m.version_id HAVING sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END)<count(*)
+        ORDER BY (count(*)-sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END)) DESC,t.name,f.ordinal LIMIT 100`).bind(project.id,parentId,project.id,project.id).all(),
+      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.status,b.added_count AS addedCount,
+        b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,b.raw_sql AS rawSql,
+        v.name AS versionName,group_concat(DISTINCT e.name) AS environmentNames
+        FROM import_batches b JOIN catalog_versions v ON v.id=b.version_id
+        LEFT JOIN field_scopes fs ON fs.import_batch_id=b.id LEFT JOIN catalog_environments e ON e.id=fs.environment_id
+        WHERE b.project_id=? GROUP BY b.id ORDER BY b.created_at DESC LIMIT 50`).bind(project.id).all(),
+    ]);
+    return Response.json({ differences:differenceRows.results,imports:historyRows.results });
+  }
+
+  const [projects,environments,versions,modules,tables,fieldSummary,imports,repositories] = await db.batch([
     db.prepare(`SELECT p.id,p.code,p.name,p.kind,p.parent_id AS parentId,p.description,
       count(DISTINCT e.id) AS environmentCount,count(DISTINCT v.id) AS versionCount,count(DISTINCT fs.field_id) AS fieldCount
       FROM catalog_projects p LEFT JOIN catalog_environments e ON e.project_id=p.id AND e.archived=0
@@ -59,23 +116,17 @@ export async function GET() {
     db.prepare(`SELECT t.id,t.code,t.name,t.comment,t.module_id AS moduleId,m.name AS moduleName,count(DISTINCT f.id) AS fieldCount
       FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN catalog_fields f ON f.table_id=t.id
       GROUP BY t.id ORDER BY t.name`),
-    db.prepare(`SELECT f.id,f.code,f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,f.source_kind AS sourceKind,
-      t.id AS tableId,t.name AS tableName,t.code AS tableCode,m.name AS moduleName,
-      group_concat(DISTINCT p.name) AS projectNames,group_concat(DISTINCT e.name) AS environmentNames,count(DISTINCT fs.environment_id) AS scopeCount
-      FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id LEFT JOIN catalog_modules m ON m.id=t.module_id
-      LEFT JOIN field_scopes fs ON fs.field_id=f.id LEFT JOIN catalog_projects p ON p.id=fs.project_id LEFT JOIN catalog_environments e ON e.id=fs.environment_id
-      GROUP BY f.id ORDER BY t.name,f.ordinal,f.name`),
-    db.prepare(`SELECT fs.field_id AS fieldId,fs.project_id AS projectId,fs.version_id AS versionId,fs.environment_id AS environmentId,fs.state,fs.origin
-      FROM field_scopes fs`),
+    db.prepare(`SELECT count(*) AS count FROM catalog_fields`),
     db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.status,b.added_count AS addedCount,
-      b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,p.name AS projectName,v.name AS versionName
+      b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,b.raw_sql AS rawSql,
+      b.project_id AS projectId,p.name AS projectName,v.name AS versionName
       FROM import_batches b JOIN catalog_projects p ON p.id=b.project_id JOIN catalog_versions v ON v.id=b.version_id
       ORDER BY b.created_at DESC LIMIT 30`),
     db.prepare(`SELECT r.id,r.name,r.repository,r.branch,r.path_pattern AS pathPattern,r.project_id AS projectId,r.last_commit AS lastCommit,r.enabled
       FROM repository_sources r ORDER BY r.created_at DESC`),
   ]);
   return Response.json({ projects:projects.results,environments:environments.results,versions:versions.results,modules:modules.results,
-    tables:tables.results,fields:fields.results,scopes:scopes.results,imports:imports.results,repositories:repositories.results });
+    tables:tables.results,fields:[],scopes:[],fieldTotal:Number((fieldSummary.results[0] as {count?:number}|undefined)?.count??0),imports:imports.results,repositories:repositories.results });
 }
 
 export async function POST(request:Request) {
@@ -231,11 +282,12 @@ export async function POST(request:Request) {
     if (existingBatch) return Response.json({ ok:true,duplicateBatch:true,batchCode:existingBatch.code,warnings:parsed.warnings });
 
     const [tableRows,fieldRows,batchCount]=await Promise.all([
-      db.prepare(`SELECT id,code,name,module_id AS moduleId FROM catalog_tables`).all<{id:string;code:string;name:string;moduleId:string|null}>(),
+      db.prepare(`SELECT id,code,name,comment,module_id AS moduleId FROM catalog_tables`).all<{id:string;code:string;name:string;comment:string;moduleId:string|null}>(),
       db.prepare(`SELECT f.id,f.code,f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,t.name AS tableName,t.id AS tableId FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id`).all<{id:string;code:string;name:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string;tableName:string;tableId:string}>(),
       db.prepare(`SELECT count(*) AS count FROM import_batches`).first<{count:number}>(),
     ]);
     const tableMap=new Map(tableRows.results.map((item)=>[item.name.toLowerCase(),item]));
+    const parsedTableMap=new Map(parsed.tables.map((item)=>[item.name,item]));
     const fieldMap=new Map(fieldRows.results.map((item)=>[`${item.tableName.toLowerCase()}.${item.name.toLowerCase()}`,item]));
     const tableCodes=new Set(tableRows.results.map((item)=>item.code)); const fieldCodes=new Set(fieldRows.results.map((item)=>item.code));
     const batchDate=new Date(Date.now()+8*60*60*1000).toISOString().slice(0,10).replaceAll('-','');
@@ -246,9 +298,12 @@ export async function POST(request:Request) {
     for (const parsedField of parsed.fields) {
       let table=tableMap.get(parsedField.tableName);
       if (!table) {
-        const created={ id:id(),code:tableCode(parsedField.tableName,tableCodes),name:parsedField.tableName,moduleId };
-        statements.push(db.prepare(`INSERT INTO catalog_tables VALUES (?,?,?,?,?,?,?)`).bind(created.id,created.code,created.name,'',moduleId,batchId,now()));
+        const created={ id:id(),code:tableCode(parsedField.tableName,tableCodes),name:parsedField.tableName,comment:parsedTableMap.get(parsedField.tableName)?.comment??'',moduleId };
+        statements.push(db.prepare(`INSERT INTO catalog_tables VALUES (?,?,?,?,?,?,?)`).bind(created.id,created.code,created.name,created.comment,moduleId,batchId,now()));
         table=created; tableMap.set(created.name,created);
+      } else {
+        const tableComment=parsedTableMap.get(parsedField.tableName)?.comment;
+        if (tableComment&&!table.comment) { statements.push(db.prepare(`UPDATE catalog_tables SET comment=? WHERE id=?`).bind(tableComment,table.id)); table.comment=tableComment; }
       }
       const key=`${parsedField.tableName}.${(parsedField.previousName||parsedField.columnName).toLowerCase()}`;
       const existing=fieldMap.get(key);
@@ -274,7 +329,7 @@ export async function POST(request:Request) {
       fieldMap.set(`${parsedField.tableName}.${parsedField.columnName.toLowerCase()}`,{id:fieldId,code,name:parsedField.columnName,dataType:parsedField.dataType,nullable:parsedField.nullable?1:0,defaultValue:parsedField.defaultValue,comment:parsedField.comment,extra:parsedField.extra,tableName:parsedField.tableName,tableId:table.id});
       added+=1;
     }
-    statements.unshift(db.prepare(`INSERT INTO import_batches VALUES (?,?,?,?,?,?,?,?,?,'active',?,?,?, ?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,fingerprint,projectId,versionId,moduleId,added,duplicates,conflicts,now()));
+    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,fingerprint,raw_sql,project_id,version_id,module_id,status,added_count,duplicate_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,fingerprint,sql,projectId,versionId,moduleId,added,duplicates,conflicts,now()));
     await runChunked(db,statements);
     return Response.json({ ok:true,batchCode,added,duplicates,conflicts,warnings:parsed.warnings });
   }

@@ -12,7 +12,8 @@ export type ParsedField = {
   statementNo:number;
 };
 
-export type ParseResult = { fields:ParsedField[]; warnings:string[] };
+export type ParsedTable = { name:string; comment:string };
+export type ParseResult = { fields:ParsedField[]; tables:ParsedTable[]; warnings:string[] };
 
 function splitTopLevel(value:string, separator=',') {
   const parts:string[] = [];
@@ -74,14 +75,17 @@ function parseDefinition(definition:string, context:{tableName:string;action:Par
 
 export function parseMysqlSql(sql:string):ParseResult {
   const fields:ParsedField[] = [];
+  const tables:ParsedTable[] = [];
   const warnings:string[] = [];
   const statements = splitStatements(sql);
 
   statements.forEach((statement, statementIndex) => {
     const statementNo = statementIndex + 1;
-    const create = statement.match(/\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$]+`?\.)?`?([A-Za-z0-9_$]+)`?\s*\(([\s\S]*)\)\s*(?:ENGINE|DEFAULT|CHARSET|COLLATE|COMMENT|$)/i);
+    const create = statement.match(/\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$]+`?\.)?`?([A-Za-z0-9_$]+)`?\s*\(([\s\S]*)\)\s*([\s\S]*)$/i);
     if (create) {
       const tableName = create[1].toLowerCase();
+      const tableComment = create[3].match(/\bCOMMENT\s*=\s*((?:'(?:\\'|[^'])*')|(?:"(?:\\"|[^"])*"))/i);
+      tables.push({ name:tableName,comment:tableComment?unquote(tableComment[1]):'' });
       let ordinal = 0;
       splitTopLevel(create[2]).forEach((definition) => {
         if (/^(?:PRIMARY|UNIQUE|KEY|INDEX|CONSTRAINT|FOREIGN|CHECK|FULLTEXT|SPATIAL)\b/i.test(definition)) return;
@@ -121,7 +125,7 @@ export function parseMysqlSql(sql:string):ParseResult {
     warnings.push(`第 ${statementNo} 条语句不是受支持的 CREATE TABLE 或 ALTER TABLE。`);
   });
 
-  return { fields, warnings };
+  return { fields, tables, warnings };
 }
 
 export function fieldFingerprint(field:Pick<ParsedField,'tableName'|'columnName'|'dataType'|'nullable'|'defaultValue'|'comment'|'extra'>) {

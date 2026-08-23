@@ -1,0 +1,1 @@
+ALTER TABLE `import_batches` ADD `raw_sql` text DEFAULT '' NOT NULL;

@@ -22,6 +22,13 @@
       "when": 1787453365971,
       "tag": "0002_bored_wonder_man",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1787460837090,
+      "tag": "0003_tired_nova",
+      "breakpoints": true
     }
   ]
 }
