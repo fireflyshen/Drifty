@@ -41,7 +41,40 @@ function splitTopLevel(value:string, separator=',') {
 
 function splitStatements(sql:string) {
   const cleaned = sql.replace(/^\s*(?:--|#).*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ' ');
-  return splitTopLevel(cleaned, ';').map((statement) => statement.trim()).filter(Boolean);
+  const statements:string[]=[];
+  let current='';
+  let depth=0;
+  let quote='';
+  let lineStart=true;
+  for (let index=0;index<cleaned.length;index+=1) {
+    const char=cleaned[index];
+    const next=cleaned[index+1];
+    if (quote) {
+      current+=char;
+      if (char==='\\'&&next) { current+=next;index+=1;continue; }
+      if (char===quote) quote='';
+      lineStart=char==='\n';
+      continue;
+    }
+    if (char==="'"||char==='"'||char==='`') { quote=char;current+=char;lineStart=false;continue; }
+    if (char==='(') depth+=1;
+    if (char===')') depth=Math.max(0,depth-1);
+    if (char===';'&&depth===0) {
+      if (current.trim()) statements.push(current.trim());
+      current='';lineStart=true;continue;
+    }
+    if (lineStart&&depth===0&&current.trim()) {
+      const rest=cleaned.slice(index);
+      if (/^\s*(?:CREATE\s+(?:TEMPORARY\s+)?TABLE|ALTER\s+TABLE)\b/i.test(rest)) {
+        statements.push(current.trim());
+        current='';
+      }
+    }
+    current+=char;
+    lineStart=char==='\n';
+  }
+  if (current.trim()) statements.push(current.trim());
+  return statements;
 }
 
 function unquote(value:string) {
@@ -81,7 +114,7 @@ export function parseMysqlSql(sql:string):ParseResult {
 
   statements.forEach((statement, statementIndex) => {
     const statementNo = statementIndex + 1;
-    const create = statement.match(/\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$]+`?\.)?`?([A-Za-z0-9_$]+)`?\s*\(([\s\S]*)\)\s*([\s\S]*)$/i);
+    const create = statement.match(/\bCREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$]+`?\.)?`?([A-Za-z0-9_$]+)`?\s*\(([\s\S]*)\)\s*([\s\S]*)$/i);
     if (create) {
       const tableName = create[1].toLowerCase();
       const tableComment = create[3].match(/\bCOMMENT\s*=\s*((?:'(?:\\'|[^'])*')|(?:"(?:\\"|[^"])*"))/i);
@@ -100,10 +133,10 @@ export function parseMysqlSql(sql:string):ParseResult {
     if (alter) {
       const tableName = alter[1].toLowerCase();
       splitTopLevel(alter[2]).forEach((clause, clauseIndex) => {
-        const add = clause.match(/^ADD\s+(?:COLUMN\s+)?([\s\S]+)$/i);
+        const add = clause.match(/^ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([\s\S]+)$/i);
         const modify = clause.match(/^MODIFY\s+(?:COLUMN\s+)?([\s\S]+)$/i);
         const change = clause.match(/^CHANGE\s+(?:COLUMN\s+)?`?([A-Za-z0-9_$]+)`?\s+([\s\S]+)$/i);
-        const drop = clause.match(/^DROP\s+(?:COLUMN\s+)?`?([A-Za-z0-9_$]+)`?/i);
+        const drop = clause.match(/^DROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?`?([A-Za-z0-9_$]+)`?/i);
         if (add) {
           const parsed = parseDefinition(add[1], { tableName, action:'add', statementNo, ordinal:clauseIndex + 1 });
           if (parsed) fields.push(parsed); else warnings.push(`第 ${statementNo} 条 ADD COLUMN 无法识别。`);
@@ -121,6 +154,8 @@ export function parseMysqlSql(sql:string):ParseResult {
       });
       return;
     }
+
+    if (/^(?:SET\b|USE\b|DROP\s+TABLE\b|LOCK\s+TABLES\b|UNLOCK\s+TABLES\b|START\s+TRANSACTION\b|COMMIT\b)/i.test(statement.trim())) return;
 
     warnings.push(`第 ${statementNo} 条语句不是受支持的 CREATE TABLE 或 ALTER TABLE。`);
   });

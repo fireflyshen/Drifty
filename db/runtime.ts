@@ -19,8 +19,8 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS idx_catalog_fields_table ON catalog_fields(table_id)`,
   `CREATE TABLE IF NOT EXISTS field_scopes (field_id text NOT NULL, project_id text NOT NULL, version_id text NOT NULL, environment_id text NOT NULL, state text DEFAULT 'present' NOT NULL, origin text DEFAULT 'manual' NOT NULL, import_batch_id text, created_at text NOT NULL, PRIMARY KEY(field_id,version_id,environment_id), FOREIGN KEY(field_id) REFERENCES catalog_fields(id) ON DELETE CASCADE, FOREIGN KEY(project_id) REFERENCES catalog_projects(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_field_scopes_environment ON field_scopes(environment_id)`,
-  `CREATE TABLE IF NOT EXISTS import_batches (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, source_kind text NOT NULL, file_name text, source_path text, git_commit text, fingerprint text NOT NULL, raw_sql text DEFAULT '' NOT NULL, project_id text NOT NULL, version_id text NOT NULL, module_id text, status text DEFAULT 'active' NOT NULL, added_count integer DEFAULT 0 NOT NULL, duplicate_count integer DEFAULT 0 NOT NULL, conflict_count integer DEFAULT 0 NOT NULL, created_at text NOT NULL, reverted_at text, FOREIGN KEY(project_id) REFERENCES catalog_projects(id), FOREIGN KEY(version_id) REFERENCES catalog_versions(id), FOREIGN KEY(module_id) REFERENCES catalog_modules(id))`,
-  `CREATE TABLE IF NOT EXISTS import_items (id text PRIMARY KEY NOT NULL, batch_id text NOT NULL, statement_no integer NOT NULL, action text NOT NULL, table_name text NOT NULL, column_name text NOT NULL, field_id text, result text NOT NULL, message text DEFAULT '' NOT NULL, fingerprint text NOT NULL, FOREIGN KEY(batch_id) REFERENCES import_batches(id) ON DELETE CASCADE)`,
+  `CREATE TABLE IF NOT EXISTS import_batches (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, source_kind text NOT NULL, file_name text, source_path text, git_commit text, fingerprint text NOT NULL, raw_sql text DEFAULT '' NOT NULL, project_id text NOT NULL, version_id text NOT NULL, module_id text, status text DEFAULT 'active' NOT NULL, added_count integer DEFAULT 0 NOT NULL, duplicate_count integer DEFAULT 0 NOT NULL, modified_count integer DEFAULT 0 NOT NULL, removed_count integer DEFAULT 0 NOT NULL, conflict_count integer DEFAULT 0 NOT NULL, created_at text NOT NULL, reverted_at text, FOREIGN KEY(project_id) REFERENCES catalog_projects(id), FOREIGN KEY(version_id) REFERENCES catalog_versions(id), FOREIGN KEY(module_id) REFERENCES catalog_modules(id))`,
+  `CREATE TABLE IF NOT EXISTS import_items (id text PRIMARY KEY NOT NULL, batch_id text NOT NULL, statement_no integer NOT NULL, action text NOT NULL, table_name text NOT NULL, column_name text NOT NULL, field_id text, result text NOT NULL, message text DEFAULT '' NOT NULL, fingerprint text NOT NULL, before_snapshot text, FOREIGN KEY(batch_id) REFERENCES import_batches(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_items(batch_id)`,
   `CREATE TABLE IF NOT EXISTS import_batch_environments (batch_id text NOT NULL, environment_id text NOT NULL, PRIMARY KEY(batch_id,environment_id), FOREIGN KEY(batch_id) REFERENCES import_batches(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_import_batch_environments_environment ON import_batch_environments(environment_id)`,
@@ -71,10 +71,11 @@ export function getD1() { if (!env.DB) throw new Error('Cloudflare D1 binding `D
 export async function ensureDatabase() {
   const db = getD1();
   await db.batch(statements.map((sql) => db.prepare(sql)));
-  const [projectColumns,versionColumns,importColumns] = await Promise.all([
+  const [projectColumns,versionColumns,importColumns,importItemColumns] = await Promise.all([
     db.prepare(`PRAGMA table_info(catalog_projects)`).all<{name:string}>(),
     db.prepare(`PRAGMA table_info(catalog_versions)`).all<{name:string}>(),
     db.prepare(`PRAGMA table_info(import_batches)`).all<{name:string}>(),
+    db.prepare(`PRAGMA table_info(import_items)`).all<{name:string}>(),
   ]);
   const alterations:D1PreparedStatement[]=[];
   if (!projectColumns.results.some((column) => column.name === 'icon')) alterations.push(db.prepare(`ALTER TABLE catalog_projects ADD COLUMN icon text DEFAULT 'boxes' NOT NULL`));
@@ -84,6 +85,9 @@ export async function ensureDatabase() {
   if (!importColumns.results.some((column) => column.name === 'raw_sql')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN raw_sql text DEFAULT '' NOT NULL`));
   if (!importColumns.results.some((column) => column.name === 'source_path')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN source_path text`));
   if (!importColumns.results.some((column) => column.name === 'git_commit')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN git_commit text`));
+  if (!importColumns.results.some((column) => column.name === 'modified_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN modified_count integer DEFAULT 0 NOT NULL`));
+  if (!importColumns.results.some((column) => column.name === 'removed_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN removed_count integer DEFAULT 0 NOT NULL`));
+  if (!importItemColumns.results.some((column) => column.name === 'before_snapshot')) alterations.push(db.prepare(`ALTER TABLE import_items ADD COLUMN before_snapshot text`));
   if (alterations.length) await db.batch(alterations);
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_versions_repository ON catalog_versions(repository_id)`).run();
   const seedMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='initial_seed'`).first();

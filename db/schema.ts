@@ -93,6 +93,7 @@ export const importBatches = sqliteTable('import_batches', {
   fileName: text('file_name'), sourcePath: text('source_path'), gitCommit: text('git_commit'), fingerprint: text('fingerprint').notNull(), rawSql: text('raw_sql').notNull().default(''), projectId: text('project_id').notNull().references(() => catalogProjects.id),
   versionId: text('version_id').notNull().references(() => catalogVersions.id), moduleId: text('module_id').references(() => catalogModules.id),
   status: text('status').notNull().default('active'), addedCount: integer('added_count').notNull().default(0), duplicateCount: integer('duplicate_count').notNull().default(0),
+  modifiedCount: integer('modified_count').notNull().default(0), removedCount: integer('removed_count').notNull().default(0),
   conflictCount: integer('conflict_count').notNull().default(0), createdAt: text('created_at').notNull(), revertedAt: text('reverted_at'),
 });
 
@@ -100,6 +101,7 @@ export const importItems = sqliteTable('import_items', {
   id: text('id').primaryKey(), batchId: text('batch_id').notNull().references(() => importBatches.id, { onDelete:'cascade' }),
   statementNo: integer('statement_no').notNull(), action: text('action').notNull(), tableName: text('table_name').notNull(), columnName: text('column_name').notNull(),
   fieldId: text('field_id'), result: text('result').notNull(), message: text('message').notNull().default(''), fingerprint: text('fingerprint').notNull(),
+  beforeSnapshot: text('before_snapshot'),
 }, (table) => [index('idx_import_items_batch').on(table.batchId)]);
 
 export const importBatchEnvironments = sqliteTable('import_batch_environments', {

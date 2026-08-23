@@ -45,7 +45,9 @@ export async function GET(request:Request) {
 
   if (mode === 'search') {
     const query=clean(url.searchParams.get('q')).toLowerCase();
-    if (!query) return Response.json({ fields:[],scopes:[],total:0 });
+    const limit=Math.min(40,Math.max(1,Number(url.searchParams.get('limit'))||20));
+    const offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
+    if (!query) return Response.json({ fields:[],scopes:[],total:0,offset,hasMore:false });
     const where:string[]=[`(lower(f.code) LIKE ? OR lower(t.name || '.' || f.name) LIKE ? OR lower(f.comment) LIKE ? OR lower(t.comment) LIKE ?)`];
     const bindings:unknown[]=[`%${query}%`,`%${query}%`,`%${query}%`,`%${query}%`];
     const condition=where.join(' AND ');
@@ -55,20 +57,21 @@ export async function GET(request:Request) {
         group_concat(DISTINCT p.name) AS projectNames,group_concat(DISTINCT e.name) AS environmentNames,count(DISTINCT fs.environment_id) AS scopeCount
         FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id LEFT JOIN catalog_modules m ON m.id=t.module_id
         LEFT JOIN field_scopes fs ON fs.field_id=f.id LEFT JOIN catalog_projects p ON p.id=fs.project_id LEFT JOIN catalog_environments e ON e.id=fs.environment_id
-        WHERE ${condition} GROUP BY f.id ORDER BY CASE WHEN lower(t.name || '.' || f.name)=? THEN 0 WHEN lower(f.code)=? THEN 1 ELSE 2 END,t.name,f.ordinal,f.name LIMIT 80`).bind(...bindings,` ${query}`.trim(),query).all(),
+        WHERE ${condition} GROUP BY f.id ORDER BY CASE WHEN lower(t.name || '.' || f.name)=? THEN 0 WHEN lower(f.code)=? THEN 1 ELSE 2 END,t.name,f.ordinal,f.name LIMIT ? OFFSET ?`).bind(...bindings,query,query,limit,offset).all(),
       db.prepare(`SELECT count(*) AS count FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id WHERE ${condition}`).bind(...bindings).first<{count:number}>(),
     ]);
     const ids=fieldRows.results.map(row=>String((row as Record<string,unknown>).id));
     const placeholders=ids.map(()=>'?').join(',');
     const scopeRows=ids.length?await db.prepare(`SELECT field_id AS fieldId,project_id AS projectId,version_id AS versionId,environment_id AS environmentId,state,origin FROM field_scopes WHERE field_id IN (${placeholders})`).bind(...ids).all():{results:[]};
-    return Response.json({ fields:fieldRows.results,scopes:scopeRows.results,total:Number(totalRow?.count??0) });
+    const total=Number(totalRow?.count??0);
+    return Response.json({ fields:fieldRows.results,scopes:scopeRows.results,total,offset,hasMore:offset+fieldRows.results.length<total });
   }
 
   if (mode === 'import') {
     const importId=clean(url.searchParams.get('importId'));
     const [batch,items]=await Promise.all([
       db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
-        b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+        b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
         b.raw_sql AS rawSql,b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,
         m.name AS moduleName,r.repository,r.branch AS repositoryBranch,v.git_ref AS gitRef,
         group_concat(be.environment_id,'|||') AS environmentIds,group_concat(e.name,'|||') AS environmentNames
@@ -101,7 +104,7 @@ export async function GET(request:Request) {
         LEFT JOIN field_scopes fs ON fs.field_id=ex.field_id AND fs.environment_id=?
         WHERE fs.field_id IS NULL ORDER BY t.name,f.ordinal,f.name LIMIT 80`).bind(environment.projectId,parentId,environment.id).all(),
       db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
-        b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+        b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
         b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,m.name AS moduleName
         FROM import_batch_environments be JOIN import_batches b ON b.id=be.batch_id JOIN catalog_projects p ON p.id=b.project_id
         JOIN catalog_versions v ON v.id=b.version_id LEFT JOIN catalog_modules m ON m.id=b.module_id
@@ -134,7 +137,7 @@ export async function GET(request:Request) {
         GROUP BY f.id,m.version_id HAVING sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END)<count(*)
         ORDER BY (count(*)-sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END)) DESC,t.name,f.ordinal LIMIT 100`).bind(project.id,parentId,project.id,project.id).all(),
       db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,b.status,b.added_count AS addedCount,
-        b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+        b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
         b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,v.name AS versionName,m.name AS moduleName,
         group_concat(e.name,' · ') AS environmentNames
         FROM import_batches b JOIN catalog_versions v ON v.id=b.version_id
@@ -167,7 +170,7 @@ export async function GET(request:Request) {
       GROUP BY t.id ORDER BY t.name`),
     db.prepare(`SELECT count(*) AS count FROM catalog_fields`),
     db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
-      b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+      b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
       b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,m.name AS moduleName,
       group_concat(e.name,' · ') AS environmentNames
       FROM import_batches b JOIN catalog_projects p ON p.id=b.project_id JOIN catalog_versions v ON v.id=b.version_id
@@ -345,13 +348,14 @@ export async function POST(request:Request) {
     if (!sql||!projectId||!versionId||!environmentIds.length) return Response.json({ error:'请提供 SQL，并选择项目、版本和至少一个环境。' },{ status:400 });
     const parsed=parseMysqlSql(sql);
     if (!parsed.fields.length) return Response.json({ error:'没有识别到字段定义。',warnings:parsed.warnings },{ status:400 });
+    if (parsed.warnings.length) return Response.json({ error:`有 ${parsed.warnings.length} 处 SQL 无法安全识别，未写入任何数据。${parsed.warnings[0]}`,warnings:parsed.warnings },{ status:400 });
     const fingerprint=await hash(`${projectId}|${versionId}|${environmentIds.sort().join(',')}|${sql.replace(/\s+/g,' ').trim()}`);
     const existingBatch=await db.prepare(`SELECT id,code FROM import_batches WHERE fingerprint=? AND status='active'`).bind(fingerprint).first<{id:string;code:string}>();
     if (existingBatch) return Response.json({ ok:true,duplicateBatch:true,batchCode:existingBatch.code,warnings:parsed.warnings });
 
     const [tableRows,fieldRows,batchCount]=await Promise.all([
       db.prepare(`SELECT id,code,name,comment,module_id AS moduleId FROM catalog_tables`).all<{id:string;code:string;name:string;comment:string;moduleId:string|null}>(),
-      db.prepare(`SELECT f.id,f.code,f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,t.name AS tableName,t.id AS tableId FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id`).all<{id:string;code:string;name:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string;tableName:string;tableId:string}>(),
+      db.prepare(`SELECT f.id,f.code,f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,f.ordinal,t.name AS tableName,t.id AS tableId FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id`).all<{id:string;code:string;name:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string;ordinal:number;tableName:string;tableId:string}>(),
       db.prepare(`SELECT count(*) AS count FROM import_batches`).first<{count:number}>(),
     ]);
     const tableMap=new Map(tableRows.results.map((item)=>[item.name.toLowerCase(),item]));
@@ -361,7 +365,7 @@ export async function POST(request:Request) {
     const batchDate=new Date(Date.now()+8*60*60*1000).toISOString().slice(0,10).replaceAll('-','');
     const batchId=id(),batchCode=`IMP-${batchDate}-${String((batchCount?.count??0)+1).padStart(3,'0')}`;
     const statements:D1PreparedStatement[]=[];
-    let added=0,duplicates=0,conflicts=0;
+    let added=0,duplicates=0,modified=0,removed=0,conflicts=0;
 
     for (const parsedField of parsed.fields) {
       let table=tableMap.get(parsedField.tableName);
@@ -377,40 +381,72 @@ export async function POST(request:Request) {
       const existing=fieldMap.get(key);
       if (parsedField.action==='drop') {
         if (!existing) { duplicates+=1; statements.push(importItem(db,batchId,parsedField,null,'skipped','字段不存在，无需删除。')); continue; }
+        const placeholders=environmentIds.map(()=>'?').join(',');
+        const priorScopes=await db.prepare(`SELECT field_id AS fieldId,project_id AS projectId,version_id AS versionId,environment_id AS environmentId,state,origin,import_batch_id AS importBatchId,created_at AS createdAt FROM field_scopes WHERE field_id=? AND version_id=? AND environment_id IN (${placeholders})`).bind(existing.id,versionId,...environmentIds).all();
         environmentIds.forEach((environmentId)=>statements.push(db.prepare(`DELETE FROM field_scopes WHERE field_id=? AND version_id=? AND environment_id=?`).bind(existing.id,versionId,environmentId)));
-        statements.push(importItem(db,batchId,parsedField,existing.id,'scope_removed','已从所选环境移除字段关系。')); continue;
+        statements.push(importItem(db,batchId,parsedField,existing.id,'removed','已从所选环境删除字段登记。',{field:existing,scopes:priorScopes.results}));removed+=1;continue;
       }
       const incomingFingerprint=fieldFingerprint(parsedField);
       if (existing) {
         const existingFingerprint=fieldFingerprint({ tableName:parsedField.tableName,columnName:existing.name,dataType:existing.dataType,nullable:Boolean(existing.nullable),defaultValue:existing.defaultValue,comment:existing.comment,extra:existing.extra });
+        if (parsedField.action==='modify'||parsedField.action==='change') {
+          const targetKey=`${parsedField.tableName}.${parsedField.columnName.toLowerCase()}`;
+          const renamedConflict=parsedField.action==='change'&&targetKey!==key&&fieldMap.has(targetKey);
+          if (renamedConflict) { conflicts+=1;statements.push(importItem(db,batchId,parsedField,existing.id,'conflict','目标字段名已经存在，未执行重命名。'));continue; }
+          statements.push(db.prepare(`UPDATE catalog_fields SET name=?,data_type=?,nullable=?,default_value=?,comment=?,extra=?,ordinal=?,source_kind=? WHERE id=?`).bind(parsedField.columnName.toLowerCase(),parsedField.dataType,parsedField.nullable?1:0,parsedField.defaultValue,parsedField.comment,parsedField.extra,parsedField.ordinal,sourceKind,existing.id));
+          environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present',?,?,?)`).bind(existing.id,projectId,versionId,environmentId,sourceKind,batchId,now())));
+          statements.push(importItem(db,batchId,parsedField,existing.id,'modified',parsedField.action==='change'?'已更新字段名称和定义，并登记到所选环境。':'已更新字段定义，并登记到所选环境。',{field:existing}));
+          fieldMap.delete(key);
+          fieldMap.set(targetKey,{...existing,name:parsedField.columnName.toLowerCase(),dataType:parsedField.dataType,nullable:parsedField.nullable?1:0,defaultValue:parsedField.defaultValue,comment:parsedField.comment,extra:parsedField.extra,ordinal:parsedField.ordinal});
+          modified+=1;continue;
+        }
         if (incomingFingerprint!==existingFingerprint) {
-          conflicts+=1; statements.push(importItem(db,batchId,parsedField,existing.id,'conflict','同名字段定义不同，未自动覆盖。')); continue;
+          conflicts+=1; statements.push(importItem(db,batchId,parsedField,existing.id,'conflict','ADD 遇到同名但定义不同的字段，未自动覆盖；请改用 MODIFY COLUMN。')); continue;
         }
         duplicates+=1;
         environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present',?,?,?)`).bind(existing.id,projectId,versionId,environmentId,sourceKind,batchId,now())));
         statements.push(importItem(db,batchId,parsedField,existing.id,'duplicate','字段已存在，仅补充缺少的环境关系。')); continue;
       }
+      if (parsedField.action==='modify'||parsedField.action==='change') {
+        conflicts+=1;statements.push(importItem(db,batchId,parsedField,null,'conflict','要修改的原字段不存在，未创建新字段。'));continue;
+      }
       const fieldId=id(),code=fieldCode(table.code,fieldCodes);
       statements.push(db.prepare(`INSERT INTO catalog_fields VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,?)`).bind(fieldId,table.id,code,parsedField.columnName.toLowerCase(),parsedField.dataType,parsedField.nullable?1:0,parsedField.defaultValue,parsedField.comment,parsedField.extra,parsedField.ordinal,sourceKind,batchId,now()));
       environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present',?,?,?)`).bind(fieldId,projectId,versionId,environmentId,sourceKind,batchId,now())));
       statements.push(importItem(db,batchId,parsedField,fieldId,'added','新增字段并应用到所选环境。'));
-      fieldMap.set(`${parsedField.tableName}.${parsedField.columnName.toLowerCase()}`,{id:fieldId,code,name:parsedField.columnName,dataType:parsedField.dataType,nullable:parsedField.nullable?1:0,defaultValue:parsedField.defaultValue,comment:parsedField.comment,extra:parsedField.extra,tableName:parsedField.tableName,tableId:table.id});
+      fieldMap.set(`${parsedField.tableName}.${parsedField.columnName.toLowerCase()}`,{id:fieldId,code,name:parsedField.columnName,dataType:parsedField.dataType,nullable:parsedField.nullable?1:0,defaultValue:parsedField.defaultValue,comment:parsedField.comment,extra:parsedField.extra,ordinal:parsedField.ordinal,tableName:parsedField.tableName,tableId:table.id});
       added+=1;
     }
-    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,source_path,git_commit,fingerprint,raw_sql,project_id,version_id,module_id,status,added_count,duplicate_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,sourcePath,gitCommit,fingerprint,sql,projectId,versionId,moduleId,added,duplicates,conflicts,now()));
+    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,source_path,git_commit,fingerprint,raw_sql,project_id,version_id,module_id,status,added_count,duplicate_count,modified_count,removed_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,sourcePath,gitCommit,fingerprint,sql,projectId,versionId,moduleId,added,duplicates,modified,removed,conflicts,now()));
     statements.splice(1,0,...environmentIds.map((environmentId)=>db.prepare(`INSERT OR IGNORE INTO import_batch_environments (batch_id,environment_id) VALUES (?,?)`).bind(batchId,environmentId)));
     await runChunked(db,statements);
-    return Response.json({ ok:true,batchCode,added,duplicates,conflicts,warnings:parsed.warnings });
+    return Response.json({ ok:true,batchCode,added,duplicates,modified,removed,conflicts,warnings:parsed.warnings });
   }
 
   if (action === 'import.revert') {
     const batchId=clean(payload.id); if (!batchId) return Response.json({ error:'导入批次无效。' },{ status:400 });
     const fields=(await db.prepare(`SELECT id FROM catalog_fields WHERE import_batch_id=?`).bind(batchId).all<{id:string}>()).results;
-    const statements:D1PreparedStatement[]=[db.prepare(`DELETE FROM field_scopes WHERE import_batch_id=?`).bind(batchId)];
+    const items=(await db.prepare(`SELECT action,table_name AS tableName,column_name AS columnName,field_id AS fieldId,result,fingerprint,before_snapshot AS beforeSnapshot FROM import_items WHERE batch_id=? ORDER BY statement_no DESC,id DESC`).bind(batchId).all<{action:string;tableName:string;columnName:string;fieldId:string|null;result:string;fingerprint:string;beforeSnapshot:string|null}>()).results;
+    await db.prepare(`DELETE FROM field_scopes WHERE import_batch_id=?`).bind(batchId).run();
+    let skipped=0;
+    for (const item of items) {
+      if (!item.beforeSnapshot) continue;
+      const snapshot=JSON.parse(item.beforeSnapshot) as {field?:{id:string;name:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string;ordinal:number};scopes?:{fieldId:string;projectId:string;versionId:string;environmentId:string;state:string;origin:string;importBatchId:string|null;createdAt:string}[]};
+      if (item.result==='modified'&&snapshot.field&&item.fieldId) {
+        const current=await db.prepare(`SELECT f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,t.name AS tableName FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id WHERE f.id=?`).bind(item.fieldId).first<{name:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string;tableName:string}>();
+        const currentFingerprint=current?fieldFingerprint({tableName:current.tableName,columnName:current.name,dataType:current.dataType,nullable:Boolean(current.nullable),defaultValue:current.defaultValue,comment:current.comment,extra:current.extra}):'';
+        if (currentFingerprint===item.fingerprint) await db.prepare(`UPDATE catalog_fields SET name=?,data_type=?,nullable=?,default_value=?,comment=?,extra=?,ordinal=? WHERE id=?`).bind(snapshot.field.name,snapshot.field.dataType,snapshot.field.nullable,snapshot.field.defaultValue,snapshot.field.comment,snapshot.field.extra,snapshot.field.ordinal,item.fieldId).run();
+        else skipped+=1;
+      }
+      if (item.result==='removed'&&snapshot.scopes?.length) {
+        await runChunked(db,snapshot.scopes.map((scope)=>db.prepare(`INSERT OR REPLACE INTO field_scopes (field_id,project_id,version_id,environment_id,state,origin,import_batch_id,created_at) VALUES (?,?,?,?,?,?,?,?)`).bind(scope.fieldId,scope.projectId,scope.versionId,scope.environmentId,scope.state,scope.origin,scope.importBatchId,scope.createdAt)));
+      }
+    }
+    const statements:D1PreparedStatement[]=[];
     fields.forEach((field)=>statements.push(db.prepare(`DELETE FROM catalog_fields WHERE id=? AND NOT EXISTS (SELECT 1 FROM field_scopes WHERE field_id=?)`).bind(field.id,field.id)));
     statements.push(db.prepare(`DELETE FROM catalog_tables WHERE import_batch_id=? AND NOT EXISTS (SELECT 1 FROM catalog_fields WHERE table_id=catalog_tables.id)`).bind(batchId));
     statements.push(db.prepare(`UPDATE import_batches SET status='reverted',reverted_at=? WHERE id=?`).bind(now(),batchId));
-    await runChunked(db,statements); return Response.json({ ok:true });
+    await runChunked(db,statements); return Response.json({ ok:true,skipped });
   }
 
   if (action === 'catalog.reset') {
@@ -421,6 +457,6 @@ export async function POST(request:Request) {
   return Response.json({ error:'未知操作。' },{ status:400 });
 }
 
-function importItem(db:D1Database,batchId:string,field:ParsedField,fieldId:string|null,result:string,message:string) {
-  return db.prepare(`INSERT INTO import_items VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(id(),batchId,field.statementNo,field.action,field.tableName,field.columnName,fieldId,result,message,fieldFingerprint(field));
+function importItem(db:D1Database,batchId:string,field:ParsedField,fieldId:string|null,result:string,message:string,beforeSnapshot?:unknown) {
+  return db.prepare(`INSERT INTO import_items (id,batch_id,statement_no,action,table_name,column_name,field_id,result,message,fingerprint,before_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).bind(id(),batchId,field.statementNo,field.action,field.tableName,field.columnName,fieldId,result,message,fieldFingerprint(field),beforeSnapshot===undefined?null:JSON.stringify(beforeSnapshot));
 }
