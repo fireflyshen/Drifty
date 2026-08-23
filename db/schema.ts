@@ -39,7 +39,8 @@ export const migrationChanges = sqliteTable('migration_changes', {
 export const catalogProjects = sqliteTable('catalog_projects', {
   id: text('id').primaryKey(), code: text('code').notNull().unique(), name: text('name').notNull(),
   kind: text('kind', { enum: ['platform', 'project'] }).notNull().default('project'), parentId: text('parent_id'),
-  description: text('description').notNull().default(''), archived: integer('archived').notNull().default(0), createdAt: text('created_at').notNull(),
+  icon: text('icon').notNull().default('boxes'), description: text('description').notNull().default(''),
+  archived: integer('archived').notNull().default(0), createdAt: text('created_at').notNull(),
 });
 
 export const catalogModules = sqliteTable('catalog_modules', {
@@ -54,9 +55,10 @@ export const catalogProjectModules = sqliteTable('catalog_project_modules', {
 
 export const catalogVersions = sqliteTable('catalog_versions', {
   id: text('id').primaryKey(), projectId: text('project_id').notNull().references(() => catalogProjects.id, { onDelete:'cascade' }),
-  name: text('name').notNull(), sourceVersion: text('source_version'), status: text('status', { enum:['active','closed'] }).notNull().default('active'),
+  name: text('name').notNull(), sourceVersion: text('source_version'), repositoryId: text('repository_id'),
+  gitRef: text('git_ref'), gitCommit: text('git_commit'), status: text('status', { enum:['active','closed'] }).notNull().default('active'),
   createdAt: text('created_at').notNull(),
-}, (table) => [uniqueIndex('uq_catalog_versions_project_name').on(table.projectId, table.name)]);
+}, (table) => [uniqueIndex('uq_catalog_versions_project_name').on(table.projectId, table.name), index('idx_catalog_versions_repository').on(table.repositoryId)]);
 
 export const catalogEnvironments = sqliteTable('catalog_environments', {
   id: text('id').primaryKey(), projectId: text('project_id').notNull().references(() => catalogProjects.id, { onDelete:'cascade' }),
@@ -88,7 +90,7 @@ export const fieldScopes = sqliteTable('field_scopes', {
 
 export const importBatches = sqliteTable('import_batches', {
   id: text('id').primaryKey(), code: text('code').notNull().unique(), name: text('name').notNull(), sourceKind: text('source_kind').notNull(),
-  fileName: text('file_name'), fingerprint: text('fingerprint').notNull(), rawSql: text('raw_sql').notNull().default(''), projectId: text('project_id').notNull().references(() => catalogProjects.id),
+  fileName: text('file_name'), sourcePath: text('source_path'), gitCommit: text('git_commit'), fingerprint: text('fingerprint').notNull(), rawSql: text('raw_sql').notNull().default(''), projectId: text('project_id').notNull().references(() => catalogProjects.id),
   versionId: text('version_id').notNull().references(() => catalogVersions.id), moduleId: text('module_id').references(() => catalogModules.id),
   status: text('status').notNull().default('active'), addedCount: integer('added_count').notNull().default(0), duplicateCount: integer('duplicate_count').notNull().default(0),
   conflictCount: integer('conflict_count').notNull().default(0), createdAt: text('created_at').notNull(), revertedAt: text('reverted_at'),
@@ -99,6 +101,11 @@ export const importItems = sqliteTable('import_items', {
   statementNo: integer('statement_no').notNull(), action: text('action').notNull(), tableName: text('table_name').notNull(), columnName: text('column_name').notNull(),
   fieldId: text('field_id'), result: text('result').notNull(), message: text('message').notNull().default(''), fingerprint: text('fingerprint').notNull(),
 }, (table) => [index('idx_import_items_batch').on(table.batchId)]);
+
+export const importBatchEnvironments = sqliteTable('import_batch_environments', {
+  batchId: text('batch_id').notNull().references(() => importBatches.id, { onDelete:'cascade' }),
+  environmentId: text('environment_id').notNull().references(() => catalogEnvironments.id, { onDelete:'cascade' }),
+}, (table) => [primaryKey({ columns:[table.batchId, table.environmentId] }), index('idx_import_batch_environments_environment').on(table.environmentId)]);
 
 export const repositorySources = sqliteTable('repository_sources', {
   id: text('id').primaryKey(), name: text('name').notNull(), repository: text('repository').notNull(), branch: text('branch').notNull().default('main'),

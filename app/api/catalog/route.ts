@@ -64,6 +64,52 @@ export async function GET(request:Request) {
     return Response.json({ fields:fieldRows.results,scopes:scopeRows.results,total:Number(totalRow?.count??0) });
   }
 
+  if (mode === 'import') {
+    const importId=clean(url.searchParams.get('importId'));
+    const [batch,items]=await Promise.all([
+      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
+        b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+        b.raw_sql AS rawSql,b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,
+        m.name AS moduleName,r.repository,r.branch AS repositoryBranch,v.git_ref AS gitRef,
+        group_concat(be.environment_id,'|||') AS environmentIds,group_concat(e.name,'|||') AS environmentNames
+        FROM import_batches b JOIN catalog_projects p ON p.id=b.project_id JOIN catalog_versions v ON v.id=b.version_id
+        LEFT JOIN catalog_modules m ON m.id=b.module_id LEFT JOIN repository_sources r ON r.id=v.repository_id
+        LEFT JOIN import_batch_environments be ON be.batch_id=b.id LEFT JOIN catalog_environments e ON e.id=be.environment_id
+        WHERE b.id=? GROUP BY b.id`).bind(importId).first(),
+      db.prepare(`SELECT id,statement_no AS statementNo,action,table_name AS tableName,column_name AS columnName,result,message
+        FROM import_items WHERE batch_id=? ORDER BY statement_no,id`).bind(importId).all(),
+    ]);
+    if (!batch) return Response.json({ error:'SQL 记录不存在。' },{ status:404 });
+    return Response.json({ batch,items:items.results });
+  }
+
+  if (mode === 'environment') {
+    const environmentId=clean(url.searchParams.get('environmentId'));
+    const environment=await db.prepare(`SELECT e.id,e.project_id AS projectId,e.version_id AS versionId,e.code,e.name,e.stage,
+      e.sort_order AS sortOrder,p.name AS projectName,p.parent_id AS parentId,v.name AS versionName
+      FROM catalog_environments e JOIN catalog_projects p ON p.id=e.project_id LEFT JOIN catalog_versions v ON v.id=e.version_id
+      WHERE e.id=? AND e.archived=0`).bind(environmentId).first<{id:string;projectId:string;versionId:string|null;parentId:string|null}>();
+    if (!environment) return Response.json({ error:'环境不存在。' },{ status:404 });
+    const parentId=environment.parentId||environment.projectId;
+    const [coverage,missingRows,historyRows]=await Promise.all([
+      db.prepare(`WITH expected AS (SELECT DISTINCT field_id FROM field_scopes WHERE project_id=? OR project_id=?)
+        SELECT count(*) AS expectedCount,sum(CASE WHEN fs.field_id IS NOT NULL THEN 1 ELSE 0 END) AS presentCount
+        FROM expected ex LEFT JOIN field_scopes fs ON fs.field_id=ex.field_id AND fs.environment_id=?`).bind(environment.projectId,parentId,environment.id).first(),
+      db.prepare(`WITH expected AS (SELECT DISTINCT field_id FROM field_scopes WHERE project_id=? OR project_id=?)
+        SELECT f.id,f.code,f.name,f.data_type AS dataType,f.comment,t.name AS tableName
+        FROM expected ex JOIN catalog_fields f ON f.id=ex.field_id JOIN catalog_tables t ON t.id=f.table_id
+        LEFT JOIN field_scopes fs ON fs.field_id=ex.field_id AND fs.environment_id=?
+        WHERE fs.field_id IS NULL ORDER BY t.name,f.ordinal,f.name LIMIT 80`).bind(environment.projectId,parentId,environment.id).all(),
+      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
+        b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+        b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,m.name AS moduleName
+        FROM import_batch_environments be JOIN import_batches b ON b.id=be.batch_id JOIN catalog_projects p ON p.id=b.project_id
+        JOIN catalog_versions v ON v.id=b.version_id LEFT JOIN catalog_modules m ON m.id=b.module_id
+        WHERE be.environment_id=? ORDER BY b.created_at DESC LIMIT 30`).bind(environment.id).all(),
+    ]);
+    return Response.json({ environment,coverage,missing:missingRows.results,imports:historyRows.results });
+  }
+
   if (mode === 'project') {
     const projectId=clean(url.searchParams.get('projectId'));
     const project=await db.prepare(`SELECT id,parent_id AS parentId FROM catalog_projects WHERE id=? AND archived=0`).bind(projectId).first<{id:string;parentId:string|null}>();
@@ -87,18 +133,19 @@ export async function GET(request:Request) {
         FROM matrix m JOIN catalog_fields f ON f.id=m.field_id JOIN catalog_tables t ON t.id=f.table_id
         GROUP BY f.id,m.version_id HAVING sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END)<count(*)
         ORDER BY (count(*)-sum(CASE WHEN m.present IS NOT NULL THEN 1 ELSE 0 END)) DESC,t.name,f.ordinal LIMIT 100`).bind(project.id,parentId,project.id,project.id).all(),
-      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.status,b.added_count AS addedCount,
-        b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,b.raw_sql AS rawSql,
-        v.name AS versionName,group_concat(DISTINCT e.name) AS environmentNames
+      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,b.status,b.added_count AS addedCount,
+        b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+        b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,v.name AS versionName,m.name AS moduleName,
+        group_concat(e.name,' · ') AS environmentNames
         FROM import_batches b JOIN catalog_versions v ON v.id=b.version_id
-        LEFT JOIN field_scopes fs ON fs.import_batch_id=b.id LEFT JOIN catalog_environments e ON e.id=fs.environment_id
+        LEFT JOIN catalog_modules m ON m.id=b.module_id LEFT JOIN import_batch_environments be ON be.batch_id=b.id LEFT JOIN catalog_environments e ON e.id=be.environment_id
         WHERE b.project_id=? GROUP BY b.id ORDER BY b.created_at DESC LIMIT 50`).bind(project.id).all(),
     ]);
     return Response.json({ differences:differenceRows.results,imports:historyRows.results });
   }
 
   const [projects,environments,versions,modules,tables,fieldSummary,imports,repositories] = await db.batch([
-    db.prepare(`SELECT p.id,p.code,p.name,p.kind,p.parent_id AS parentId,p.description,
+    db.prepare(`SELECT p.id,p.code,p.name,p.kind,p.parent_id AS parentId,p.icon,p.description,
       count(DISTINCT e.id) AS environmentCount,count(DISTINCT v.id) AS versionCount,count(DISTINCT fs.field_id) AS fieldCount
       FROM catalog_projects p LEFT JOIN catalog_environments e ON e.project_id=p.id AND e.archived=0
       LEFT JOIN catalog_versions v ON v.project_id=p.id LEFT JOIN field_scopes fs ON fs.project_id=p.id
@@ -108,8 +155,10 @@ export async function GET(request:Request) {
       FROM catalog_environments e JOIN catalog_projects p ON p.id=e.project_id LEFT JOIN catalog_versions v ON v.id=e.version_id
       LEFT JOIN field_scopes fs ON fs.environment_id=e.id AND fs.version_id=e.version_id
       WHERE e.archived=0 GROUP BY e.id ORDER BY p.kind DESC,p.name,e.sort_order,e.name`),
-    db.prepare(`SELECT v.id,v.project_id AS projectId,v.name,v.source_version AS sourceVersion,v.status,p.name AS projectName
-      FROM catalog_versions v JOIN catalog_projects p ON p.id=v.project_id ORDER BY p.kind DESC,p.name,v.created_at DESC`),
+    db.prepare(`SELECT v.id,v.project_id AS projectId,v.name,v.source_version AS sourceVersion,v.repository_id AS repositoryId,
+      v.git_ref AS gitRef,v.git_commit AS gitCommit,v.status,p.name AS projectName,r.name AS repositoryName,r.repository
+      FROM catalog_versions v JOIN catalog_projects p ON p.id=v.project_id LEFT JOIN repository_sources r ON r.id=v.repository_id
+      ORDER BY p.kind DESC,p.name,v.created_at DESC`),
     db.prepare(`SELECT m.id,m.code,m.name,m.description,count(DISTINCT t.id) AS tableCount,count(DISTINCT pm.project_id) AS projectCount
       FROM catalog_modules m LEFT JOIN catalog_tables t ON t.module_id=m.id LEFT JOIN catalog_project_modules pm ON pm.module_id=m.id
       GROUP BY m.id ORDER BY m.name`),
@@ -117,11 +166,13 @@ export async function GET(request:Request) {
       FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN catalog_fields f ON f.table_id=t.id
       GROUP BY t.id ORDER BY t.name`),
     db.prepare(`SELECT count(*) AS count FROM catalog_fields`),
-    db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.status,b.added_count AS addedCount,
-      b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,b.raw_sql AS rawSql,
-      b.project_id AS projectId,p.name AS projectName,v.name AS versionName
+    db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
+      b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
+      b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,m.name AS moduleName,
+      group_concat(e.name,' · ') AS environmentNames
       FROM import_batches b JOIN catalog_projects p ON p.id=b.project_id JOIN catalog_versions v ON v.id=b.version_id
-      ORDER BY b.created_at DESC LIMIT 30`),
+      LEFT JOIN catalog_modules m ON m.id=b.module_id LEFT JOIN import_batch_environments be ON be.batch_id=b.id LEFT JOIN catalog_environments e ON e.id=be.environment_id
+      GROUP BY b.id ORDER BY b.created_at DESC LIMIT 30`),
     db.prepare(`SELECT r.id,r.name,r.repository,r.branch,r.path_pattern AS pathPattern,r.project_id AS projectId,r.last_commit AS lastCommit,r.enabled
       FROM repository_sources r ORDER BY r.created_at DESC`),
   ]);
@@ -139,11 +190,12 @@ export async function POST(request:Request) {
     const recordId = clean(payload.id);
     const name = clean(payload.name);
     const kind = clean(payload.kind) === 'platform' ? 'platform' : 'project';
+    const icon = clean(payload.icon) || (kind==='platform'?'server':'package');
     const code = (clean(payload.code) || projectCode(name)).toUpperCase();
     if (!name) return Response.json({ error:'请填写项目名称。' },{ status:400 });
     try {
-      if (recordId) await db.prepare(`UPDATE catalog_projects SET code=?,name=?,kind=?,parent_id=?,description=? WHERE id=?`).bind(code,name,kind,clean(payload.parentId)||null,clean(payload.description),recordId).run();
-      else await db.prepare(`INSERT INTO catalog_projects (id,code,name,kind,parent_id,description,archived,created_at) VALUES (?,?,?,?,?,?,0,?)`).bind(id(),code,name,kind,clean(payload.parentId)||null,clean(payload.description),now()).run();
+      if (recordId) await db.prepare(`UPDATE catalog_projects SET code=?,name=?,kind=?,parent_id=?,icon=?,description=? WHERE id=?`).bind(code,name,kind,clean(payload.parentId)||null,icon,clean(payload.description),recordId).run();
+      else await db.prepare(`INSERT INTO catalog_projects (id,code,name,kind,parent_id,icon,description,archived,created_at) VALUES (?,?,?,?,?,?,?,0,?)`).bind(id(),code,name,kind,clean(payload.parentId)||null,icon,clean(payload.description),now()).run();
       return Response.json({ ok:true });
     } catch { return Response.json({ error:'项目编码已经存在。' },{ status:409 }); }
   }
@@ -162,8 +214,8 @@ export async function POST(request:Request) {
     const recordId=clean(payload.id),projectId=clean(payload.projectId),name=clean(payload.name);
     if (!projectId||!name) return Response.json({ error:'请选择项目并填写版本。' },{ status:400 });
     try {
-      if (recordId) await db.prepare(`UPDATE catalog_versions SET project_id=?,name=?,source_version=?,status=? WHERE id=?`).bind(projectId,name,clean(payload.sourceVersion)||null,clean(payload.status)||'active',recordId).run();
-      else await db.prepare(`INSERT INTO catalog_versions VALUES (?,?,?,?,?,?)`).bind(id(),projectId,name,clean(payload.sourceVersion)||null,'active',now()).run();
+      if (recordId) await db.prepare(`UPDATE catalog_versions SET project_id=?,name=?,source_version=?,repository_id=?,git_ref=?,git_commit=?,status=? WHERE id=?`).bind(projectId,name,clean(payload.sourceVersion)||null,clean(payload.repositoryId)||null,clean(payload.gitRef)||null,clean(payload.gitCommit)||null,clean(payload.status)||'active',recordId).run();
+      else await db.prepare(`INSERT INTO catalog_versions (id,project_id,name,source_version,repository_id,git_ref,git_commit,status,created_at) VALUES (?,?,?,?,?,?,?,'active',?)`).bind(id(),projectId,name,clean(payload.sourceVersion)||null,clean(payload.repositoryId)||null,clean(payload.gitRef)||null,clean(payload.gitCommit)||null,now()).run();
       return Response.json({ ok:true });
     } catch { return Response.json({ error:'这个项目已经存在同名版本。' },{ status:409 }); }
   }
@@ -255,6 +307,11 @@ export async function POST(request:Request) {
           db.prepare(`UPDATE import_items SET field_id=NULL WHERE field_id=?`).bind(recordId),
           db.prepare(`DELETE FROM catalog_fields WHERE id=?`).bind(recordId),
         ]);
+      } else if (entity==='repository') {
+        await db.batch([
+          db.prepare(`UPDATE catalog_versions SET repository_id=NULL WHERE repository_id=?`).bind(recordId),
+          db.prepare(`DELETE FROM repository_sources WHERE id=?`).bind(recordId),
+        ]);
       } else await db.prepare(`DELETE FROM ${allowed[entity]} WHERE id=?`).bind(recordId).run();
       const remaining = await db.prepare(`SELECT id FROM ${allowed[entity]} WHERE id=?`).bind(recordId).first();
       if (remaining) return Response.json({ error:'删除没有生效，请重试。' },{ status:409 });
@@ -264,14 +321,25 @@ export async function POST(request:Request) {
   }
 
   if (action === 'repository.save') {
+    const recordId=clean(payload.id);
     const name=clean(payload.name),repository=clean(payload.repository),branch=clean(payload.branch)||'main',pathPattern=clean(payload.pathPattern)||'sql/**/*.sql';
     if (!name||!repository) return Response.json({ error:'请填写来源名称和 GitHub 仓库。' },{ status:400 });
-    await db.prepare(`INSERT INTO repository_sources VALUES (?,?,?,?,?,?,NULL,1,?)`).bind(id(),name,repository,branch,pathPattern,clean(payload.projectId)||null,now()).run();
+    if (recordId) await db.prepare(`UPDATE repository_sources SET name=?,repository=?,branch=?,path_pattern=?,project_id=? WHERE id=?`).bind(name,repository,branch,pathPattern,clean(payload.projectId)||null,recordId).run();
+    else await db.prepare(`INSERT INTO repository_sources VALUES (?,?,?,?,?,?,NULL,1,?)`).bind(id(),name,repository,branch,pathPattern,clean(payload.projectId)||null,now()).run();
+    return Response.json({ ok:true });
+  }
+
+  if (action === 'import.rename') {
+    const importId=clean(payload.id),name=clean(payload.name);
+    if (!importId||!name) return Response.json({ error:'请填写 SQL 记录名称。' },{ status:400 });
+    const updated=await db.prepare(`UPDATE import_batches SET name=? WHERE id=?`).bind(name,importId).run();
+    if (!updated.meta.changes) return Response.json({ error:'SQL 记录不存在。' },{ status:404 });
     return Response.json({ ok:true });
   }
 
   if (action === 'import.sql') {
     const sql=clean(payload.sql),projectId=clean(payload.projectId),versionId=clean(payload.versionId),moduleId=clean(payload.moduleId)||null;
+    const sourcePath=clean(payload.sourcePath)||null,gitCommit=clean(payload.gitCommit)||null;
     const environmentIds=Array.isArray(payload.environmentIds)?payload.environmentIds.map(clean).filter(Boolean):[];
     const sourceKind=['paste','upload','github'].includes(clean(payload.sourceKind))?clean(payload.sourceKind):'paste';
     if (!sql||!projectId||!versionId||!environmentIds.length) return Response.json({ error:'请提供 SQL，并选择项目、版本和至少一个环境。' },{ status:400 });
@@ -329,7 +397,8 @@ export async function POST(request:Request) {
       fieldMap.set(`${parsedField.tableName}.${parsedField.columnName.toLowerCase()}`,{id:fieldId,code,name:parsedField.columnName,dataType:parsedField.dataType,nullable:parsedField.nullable?1:0,defaultValue:parsedField.defaultValue,comment:parsedField.comment,extra:parsedField.extra,tableName:parsedField.tableName,tableId:table.id});
       added+=1;
     }
-    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,fingerprint,raw_sql,project_id,version_id,module_id,status,added_count,duplicate_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,fingerprint,sql,projectId,versionId,moduleId,added,duplicates,conflicts,now()));
+    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,source_path,git_commit,fingerprint,raw_sql,project_id,version_id,module_id,status,added_count,duplicate_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,sourcePath,gitCommit,fingerprint,sql,projectId,versionId,moduleId,added,duplicates,conflicts,now()));
+    statements.splice(1,0,...environmentIds.map((environmentId)=>db.prepare(`INSERT OR IGNORE INTO import_batch_environments (batch_id,environment_id) VALUES (?,?)`).bind(batchId,environmentId)));
     await runChunked(db,statements);
     return Response.json({ ok:true,batchCode,added,duplicates,conflicts,warnings:parsed.warnings });
   }
@@ -345,7 +414,7 @@ export async function POST(request:Request) {
   }
 
   if (action === 'catalog.reset') {
-    await db.batch([db.prepare(`DELETE FROM field_scopes`),db.prepare(`DELETE FROM import_items`),db.prepare(`DELETE FROM import_batches`),db.prepare(`DELETE FROM catalog_fields`),db.prepare(`DELETE FROM catalog_tables`)]);
+    await db.batch([db.prepare(`DELETE FROM field_scopes`),db.prepare(`DELETE FROM import_items`),db.prepare(`DELETE FROM import_batch_environments`),db.prepare(`DELETE FROM import_batches`),db.prepare(`DELETE FROM catalog_fields`),db.prepare(`DELETE FROM catalog_tables`)]);
     return Response.json({ ok:true });
   }
 
