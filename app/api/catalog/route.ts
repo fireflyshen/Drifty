@@ -164,7 +164,47 @@ export async function POST(request:Request) {
     const entity=clean(payload.entity),recordId=clean(payload.id);
     const allowed:Record<string,string>={ project:'catalog_projects',module:'catalog_modules',version:'catalog_versions',environment:'catalog_environments',table:'catalog_tables',field:'catalog_fields',repository:'repository_sources' };
     if (!allowed[entity]||!recordId) return Response.json({ error:'删除目标无效。' },{ status:400 });
-    try { await db.prepare(`DELETE FROM ${allowed[entity]} WHERE id=?`).bind(recordId).run(); return Response.json({ ok:true }); }
+    try {
+      if (entity==='project') {
+        await db.batch([
+          db.prepare(`DELETE FROM import_items WHERE batch_id IN (SELECT id FROM import_batches WHERE project_id=?)`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_fields WHERE import_batch_id IN (SELECT id FROM import_batches WHERE project_id=?) AND NOT EXISTS (SELECT 1 FROM field_scopes fs WHERE fs.field_id=catalog_fields.id AND fs.project_id<>?)`).bind(recordId,recordId),
+          db.prepare(`DELETE FROM catalog_tables WHERE import_batch_id IN (SELECT id FROM import_batches WHERE project_id=?) AND NOT EXISTS (SELECT 1 FROM catalog_fields f WHERE f.table_id=catalog_tables.id)`).bind(recordId),
+          db.prepare(`UPDATE catalog_fields SET import_batch_id=NULL WHERE import_batch_id IN (SELECT id FROM import_batches WHERE project_id=?)`).bind(recordId),
+          db.prepare(`UPDATE catalog_tables SET import_batch_id=NULL WHERE import_batch_id IN (SELECT id FROM import_batches WHERE project_id=?)`).bind(recordId),
+          db.prepare(`DELETE FROM import_batches WHERE project_id=?`).bind(recordId),
+          db.prepare(`DELETE FROM repository_sources WHERE project_id=?`).bind(recordId),
+          db.prepare(`UPDATE catalog_projects SET parent_id=NULL WHERE parent_id=?`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_projects WHERE id=?`).bind(recordId),
+        ]);
+      } else if (entity==='version') {
+        await db.batch([
+          db.prepare(`DELETE FROM import_items WHERE batch_id IN (SELECT id FROM import_batches WHERE version_id=?)`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_fields WHERE import_batch_id IN (SELECT id FROM import_batches WHERE version_id=?) AND NOT EXISTS (SELECT 1 FROM field_scopes fs WHERE fs.field_id=catalog_fields.id AND fs.version_id<>?)`).bind(recordId,recordId),
+          db.prepare(`DELETE FROM catalog_tables WHERE import_batch_id IN (SELECT id FROM import_batches WHERE version_id=?) AND NOT EXISTS (SELECT 1 FROM catalog_fields f WHERE f.table_id=catalog_tables.id)`).bind(recordId),
+          db.prepare(`UPDATE catalog_fields SET import_batch_id=NULL WHERE import_batch_id IN (SELECT id FROM import_batches WHERE version_id=?)`).bind(recordId),
+          db.prepare(`UPDATE catalog_tables SET import_batch_id=NULL WHERE import_batch_id IN (SELECT id FROM import_batches WHERE version_id=?)`).bind(recordId),
+          db.prepare(`DELETE FROM import_batches WHERE version_id=?`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_versions WHERE id=?`).bind(recordId),
+        ]);
+      } else if (entity==='module') {
+        await db.batch([
+          db.prepare(`UPDATE import_batches SET module_id=NULL WHERE module_id=?`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_modules WHERE id=?`).bind(recordId),
+        ]);
+      } else if (entity==='table') {
+        await db.batch([
+          db.prepare(`UPDATE import_items SET field_id=NULL WHERE field_id IN (SELECT id FROM catalog_fields WHERE table_id=?)`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_tables WHERE id=?`).bind(recordId),
+        ]);
+      } else if (entity==='field') {
+        await db.batch([
+          db.prepare(`UPDATE import_items SET field_id=NULL WHERE field_id=?`).bind(recordId),
+          db.prepare(`DELETE FROM catalog_fields WHERE id=?`).bind(recordId),
+        ]);
+      } else await db.prepare(`DELETE FROM ${allowed[entity]} WHERE id=?`).bind(recordId).run();
+      return Response.json({ ok:true });
+    }
     catch { return Response.json({ error:'该对象仍被其他数据引用，暂时不能删除。' },{ status:409 }); }
   }
 
