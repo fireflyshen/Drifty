@@ -164,6 +164,8 @@ export async function POST(request:Request) {
     const entity=clean(payload.entity),recordId=clean(payload.id);
     const allowed:Record<string,string>={ project:'catalog_projects',module:'catalog_modules',version:'catalog_versions',environment:'catalog_environments',table:'catalog_tables',field:'catalog_fields',repository:'repository_sources' };
     if (!allowed[entity]||!recordId) return Response.json({ error:'删除目标无效。' },{ status:400 });
+    const target = await db.prepare(`SELECT id FROM ${allowed[entity]} WHERE id=?`).bind(recordId).first();
+    if (!target) return Response.json({ error:'该对象不存在或已经删除。' },{ status:404 });
     try {
       if (entity==='project') {
         await db.batch([
@@ -203,6 +205,8 @@ export async function POST(request:Request) {
           db.prepare(`DELETE FROM catalog_fields WHERE id=?`).bind(recordId),
         ]);
       } else await db.prepare(`DELETE FROM ${allowed[entity]} WHERE id=?`).bind(recordId).run();
+      const remaining = await db.prepare(`SELECT id FROM ${allowed[entity]} WHERE id=?`).bind(recordId).first();
+      if (remaining) return Response.json({ error:'删除没有生效，请重试。' },{ status:409 });
       return Response.json({ ok:true });
     }
     catch { return Response.json({ error:'该对象仍被其他数据引用，暂时不能删除。' },{ status:409 }); }

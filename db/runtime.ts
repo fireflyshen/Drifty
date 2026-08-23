@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers';
 
 const statements = [
+  `CREATE TABLE IF NOT EXISTS runtime_meta (key text PRIMARY KEY NOT NULL, value text NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS modules (id text PRIMARY KEY NOT NULL, slug text NOT NULL UNIQUE, name text NOT NULL, kind text NOT NULL, version text NOT NULL, description text DEFAULT '' NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS projects (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, core_version text NOT NULL, status text DEFAULT 'current' NOT NULL, created_at text NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS project_modules (project_id text NOT NULL, module_id text NOT NULL, version text NOT NULL, PRIMARY KEY(project_id, module_id), FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE, FOREIGN KEY(module_id) REFERENCES modules(id) ON DELETE CASCADE)`,
@@ -67,6 +68,12 @@ export function getD1() { if (!env.DB) throw new Error('Cloudflare D1 binding `D
 export async function ensureDatabase() {
   const db = getD1();
   await db.batch(statements.map((sql) => db.prepare(sql)));
-  await db.batch(seeds.map((sql) => db.prepare(sql)));
+  const seedMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='initial_seed'`).first();
+  if (!seedMarker) {
+    await db.batch([
+      ...seeds.map((sql) => db.prepare(sql)),
+      db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('initial_seed','1')`),
+    ]);
+  }
   return db;
 }

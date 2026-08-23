@@ -1,5 +1,9 @@
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
+export const runtimeMeta = sqliteTable('runtime_meta', {
+  key: text('key').primaryKey(), value: text('value').notNull(),
+});
+
 export const modules = sqliteTable('modules', {
   id: text('id').primaryKey(), slug: text('slug').notNull().unique(), name: text('name').notNull(),
   kind: text('kind', { enum: ['core', 'feature'] }).notNull(), version: text('version').notNull(),
