@@ -38,6 +38,13 @@ try {
   assert.equal(first.hasMore,true);
   const second=await fetch(`${origin}/api/catalog?mode=search&q=drifty_smoke&projectId=${projectId}&limit=2&offset=2`).then(response=>response.json());
   assert.ok(second.fields.length>=1);
+  const tableSearch=await fetch(`${origin}/api/catalog?mode=search&entity=table&q=drifty_smoke&limit=20`).then(response=>response.json());
+  assert.equal(tableSearch.total,2);
+  assert.equal(tableSearch.tableScopes.filter(scope=>scope.environmentId===environmentId).length,2);
+  const customerTable=tableSearch.tables.find(table=>table.name==='drifty_smoke_customer');
+  const tableDetail=await fetch(`${origin}/api/catalog?mode=table&tableId=${customerTable.id}`).then(response=>response.json());
+  assert.equal(tableDetail.tableScopes.some(scope=>scope.environmentId===environmentId),true);
+  assert.ok(tableDetail.fields.length>=2);
   const imports=(await catalog()).imports;
   await request('import.revert',{id:imports.find(batch=>batch.code===removed.batchCode).id});
   const restoredArea=await fetch(`${origin}/api/catalog?mode=search&q=drifty_smoke_customer.area&environmentId=${environmentId}`).then(response=>response.json());
@@ -48,7 +55,7 @@ try {
   await request('import.revert',{id:imports.find(batch=>batch.code===modified.batchCode).id});
   const restoredName=await fetch(`${origin}/api/catalog?mode=search&q=drifty_smoke_customer.name&environmentId=${environmentId}`).then(response=>response.json());
   assert.equal(restoredName.fields[0].dataType,'varchar(80)');
-  console.log(JSON.stringify({created,added,modified,changed,removed,search:{total:first.total,page1:first.fields.length,page2:second.fields.length},revert:'ok'}));
+  console.log(JSON.stringify({created,added,modified,changed,removed,search:{total:first.total,page1:first.fields.length,page2:second.fields.length,tables:tableSearch.total},revert:'ok'}));
 } finally {
   if(projectId)await request('entity.delete',{entity:'project',id:projectId});
 }

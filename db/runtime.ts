@@ -17,6 +17,8 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS catalog_tables (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL UNIQUE, comment text DEFAULT '' NOT NULL, module_id text, import_batch_id text, created_at text NOT NULL, FOREIGN KEY(module_id) REFERENCES catalog_modules(id) ON DELETE SET NULL)`,
   `CREATE TABLE IF NOT EXISTS catalog_fields (id text PRIMARY KEY NOT NULL, table_id text NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, data_type text NOT NULL, nullable integer DEFAULT 1 NOT NULL, default_value text, comment text DEFAULT '' NOT NULL, extra text DEFAULT '' NOT NULL, ordinal integer DEFAULT 0 NOT NULL, source_kind text DEFAULT 'manual' NOT NULL, import_batch_id text, created_at text NOT NULL, FOREIGN KEY(table_id) REFERENCES catalog_tables(id) ON DELETE CASCADE, UNIQUE(table_id,name))`,
   `CREATE INDEX IF NOT EXISTS idx_catalog_fields_table ON catalog_fields(table_id)`,
+  `CREATE TABLE IF NOT EXISTS table_scopes (table_id text NOT NULL, project_id text NOT NULL, version_id text NOT NULL, environment_id text NOT NULL, state text DEFAULT 'present' NOT NULL, origin text DEFAULT 'manual' NOT NULL, import_batch_id text, created_at text NOT NULL, PRIMARY KEY(table_id,version_id,environment_id), FOREIGN KEY(table_id) REFERENCES catalog_tables(id) ON DELETE CASCADE, FOREIGN KEY(project_id) REFERENCES catalog_projects(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_table_scopes_environment ON table_scopes(environment_id)`,
   `CREATE TABLE IF NOT EXISTS field_scopes (field_id text NOT NULL, project_id text NOT NULL, version_id text NOT NULL, environment_id text NOT NULL, state text DEFAULT 'present' NOT NULL, origin text DEFAULT 'manual' NOT NULL, import_batch_id text, created_at text NOT NULL, PRIMARY KEY(field_id,version_id,environment_id), FOREIGN KEY(field_id) REFERENCES catalog_fields(id) ON DELETE CASCADE, FOREIGN KEY(project_id) REFERENCES catalog_projects(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_field_scopes_environment ON field_scopes(environment_id)`,
   `CREATE TABLE IF NOT EXISTS import_batches (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, source_kind text NOT NULL, file_name text, source_path text, git_commit text, fingerprint text NOT NULL, raw_sql text DEFAULT '' NOT NULL, project_id text NOT NULL, version_id text NOT NULL, module_id text, status text DEFAULT 'active' NOT NULL, added_count integer DEFAULT 0 NOT NULL, duplicate_count integer DEFAULT 0 NOT NULL, modified_count integer DEFAULT 0 NOT NULL, removed_count integer DEFAULT 0 NOT NULL, conflict_count integer DEFAULT 0 NOT NULL, created_at text NOT NULL, reverted_at text, FOREIGN KEY(project_id) REFERENCES catalog_projects(id), FOREIGN KEY(version_id) REFERENCES catalog_versions(id), FOREIGN KEY(module_id) REFERENCES catalog_modules(id))`,
@@ -90,6 +92,13 @@ export async function ensureDatabase() {
   if (!importItemColumns.results.some((column) => column.name === 'before_snapshot')) alterations.push(db.prepare(`ALTER TABLE import_items ADD COLUMN before_snapshot text`));
   if (alterations.length) await db.batch(alterations);
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_versions_repository ON catalog_versions(repository_id)`).run();
+  const tableScopeMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='table_scope_backfill_v1'`).first();
+  if (!tableScopeMarker) {
+    await db.batch([
+      db.prepare(`INSERT OR IGNORE INTO table_scopes (table_id,project_id,version_id,environment_id,state,origin,import_batch_id,created_at) SELECT DISTINCT f.table_id,fs.project_id,fs.version_id,fs.environment_id,fs.state,fs.origin,fs.import_batch_id,fs.created_at FROM field_scopes fs JOIN catalog_fields f ON f.id=fs.field_id`),
+      db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('table_scope_backfill_v1','1')`),
+    ]);
+  }
   const seedMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='initial_seed'`).first();
   if (!seedMarker) {
     await db.batch([

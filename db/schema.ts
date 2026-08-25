@@ -80,6 +80,14 @@ export const catalogFields = sqliteTable('catalog_fields', {
   sourceKind: text('source_kind').notNull().default('manual'), importBatchId: text('import_batch_id'), createdAt: text('created_at').notNull(),
 }, (table) => [uniqueIndex('uq_catalog_fields_table_name').on(table.tableId, table.name), index('idx_catalog_fields_table').on(table.tableId)]);
 
+export const tableScopes = sqliteTable('table_scopes', {
+  tableId: text('table_id').notNull().references(() => catalogTables.id, { onDelete:'cascade' }),
+  projectId: text('project_id').notNull().references(() => catalogProjects.id, { onDelete:'cascade' }),
+  versionId: text('version_id').notNull().references(() => catalogVersions.id, { onDelete:'cascade' }),
+  environmentId: text('environment_id').notNull().references(() => catalogEnvironments.id, { onDelete:'cascade' }),
+  state: text('state').notNull().default('present'), origin: text('origin').notNull().default('manual'), importBatchId: text('import_batch_id'), createdAt: text('created_at').notNull(),
+}, (table) => [primaryKey({ columns:[table.tableId, table.versionId, table.environmentId] }), index('idx_table_scopes_environment').on(table.environmentId)]);
+
 export const fieldScopes = sqliteTable('field_scopes', {
   fieldId: text('field_id').notNull().references(() => catalogFields.id, { onDelete:'cascade' }),
   projectId: text('project_id').notNull().references(() => catalogProjects.id, { onDelete:'cascade' }),

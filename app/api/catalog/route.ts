@@ -45,9 +45,27 @@ export async function GET(request:Request) {
 
   if (mode === 'search') {
     const query=clean(url.searchParams.get('q')).toLowerCase();
+    const entity=clean(url.searchParams.get('entity'))==='table'?'table':'field';
     const limit=Math.min(40,Math.max(1,Number(url.searchParams.get('limit'))||20));
     const offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
-    if (!query) return Response.json({ fields:[],scopes:[],total:0,offset,hasMore:false });
+    if (!query) return Response.json(entity==='table'?{ tables:[],tableScopes:[],total:0,offset,hasMore:false }:{ fields:[],scopes:[],total:0,offset,hasMore:false });
+    if (entity === 'table') {
+      const pattern=`%${query}%`;
+      const condition=`(lower(t.code) LIKE ? OR lower(t.name) LIKE ? OR lower(t.comment) LIKE ? OR lower(coalesce(m.name,'')) LIKE ?)`;
+      const [tableRows,totalRow]=await Promise.all([
+        db.prepare(`SELECT t.id,t.code,t.name,t.comment,t.module_id AS moduleId,m.name AS moduleName,count(DISTINCT f.id) AS fieldCount,
+          group_concat(DISTINCT p.name) AS projectNames,group_concat(DISTINCT e.name) AS environmentNames,count(DISTINCT ts.environment_id) AS scopeCount
+          FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN catalog_fields f ON f.table_id=t.id
+          LEFT JOIN table_scopes ts ON ts.table_id=t.id LEFT JOIN catalog_projects p ON p.id=ts.project_id LEFT JOIN catalog_environments e ON e.id=ts.environment_id
+          WHERE ${condition} GROUP BY t.id ORDER BY CASE WHEN lower(t.name)=? THEN 0 WHEN lower(t.code)=? THEN 1 ELSE 2 END,t.name LIMIT ? OFFSET ?`).bind(pattern,pattern,pattern,pattern,query,query,limit,offset).all(),
+        db.prepare(`SELECT count(*) AS count FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id WHERE ${condition}`).bind(pattern,pattern,pattern,pattern).first<{count:number}>(),
+      ]);
+      const ids=tableRows.results.map(row=>String((row as Record<string,unknown>).id));
+      const placeholders=ids.map(()=>'?').join(',');
+      const scopeRows=ids.length?await db.prepare(`SELECT table_id AS tableId,project_id AS projectId,version_id AS versionId,environment_id AS environmentId,state,origin FROM table_scopes WHERE table_id IN (${placeholders})`).bind(...ids).all():{results:[]};
+      const total=Number(totalRow?.count??0);
+      return Response.json({ tables:tableRows.results,tableScopes:scopeRows.results,total,offset,hasMore:offset+tableRows.results.length<total });
+    }
     const where:string[]=[`(lower(f.code) LIKE ? OR lower(t.name || '.' || f.name) LIKE ? OR lower(f.comment) LIKE ? OR lower(t.comment) LIKE ?)`];
     const bindings:unknown[]=[`%${query}%`,`%${query}%`,`%${query}%`,`%${query}%`];
     const condition=where.join(' AND ');
@@ -65,6 +83,22 @@ export async function GET(request:Request) {
     const scopeRows=ids.length?await db.prepare(`SELECT field_id AS fieldId,project_id AS projectId,version_id AS versionId,environment_id AS environmentId,state,origin FROM field_scopes WHERE field_id IN (${placeholders})`).bind(...ids).all():{results:[]};
     const total=Number(totalRow?.count??0);
     return Response.json({ fields:fieldRows.results,scopes:scopeRows.results,total,offset,hasMore:offset+fieldRows.results.length<total });
+  }
+
+  if (mode === 'table') {
+    const tableId=clean(url.searchParams.get('tableId'));
+    const [table,fields,scopeRows,fieldScopeRows]=await Promise.all([
+      db.prepare(`SELECT t.id,t.code,t.name,t.comment,t.module_id AS moduleId,m.name AS moduleName,count(DISTINCT f.id) AS fieldCount
+        FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN catalog_fields f ON f.table_id=t.id WHERE t.id=? GROUP BY t.id`).bind(tableId).first(),
+      db.prepare(`SELECT f.id,f.code,f.name,f.data_type AS dataType,f.nullable,f.default_value AS defaultValue,f.comment,f.extra,f.source_kind AS sourceKind,
+        t.id AS tableId,t.name AS tableName,t.code AS tableCode,m.name AS moduleName,count(DISTINCT fs.environment_id) AS scopeCount
+        FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN field_scopes fs ON fs.field_id=f.id
+        WHERE f.table_id=? GROUP BY f.id ORDER BY f.ordinal,f.name`).bind(tableId).all(),
+      db.prepare(`SELECT table_id AS tableId,project_id AS projectId,version_id AS versionId,environment_id AS environmentId,state,origin FROM table_scopes WHERE table_id=?`).bind(tableId).all(),
+      db.prepare(`SELECT fs.field_id AS fieldId,fs.project_id AS projectId,fs.version_id AS versionId,fs.environment_id AS environmentId,fs.state,fs.origin FROM field_scopes fs JOIN catalog_fields f ON f.id=fs.field_id WHERE f.table_id=?`).bind(tableId).all(),
+    ]);
+    if (!table) return Response.json({ error:'数据表不存在。' },{ status:404 });
+    return Response.json({ table,fields:fields.results,tableScopes:scopeRows.results,fieldScopes:fieldScopeRows.results });
   }
 
   if (mode === 'import') {
@@ -95,9 +129,11 @@ export async function GET(request:Request) {
     if (!environment) return Response.json({ error:'环境不存在。' },{ status:404 });
     const parentId=environment.parentId||environment.projectId;
     const [coverage,missingRows,historyRows]=await Promise.all([
-      db.prepare(`WITH expected AS (SELECT DISTINCT field_id FROM field_scopes WHERE project_id=? OR project_id=?)
-        SELECT count(*) AS expectedCount,sum(CASE WHEN fs.field_id IS NOT NULL THEN 1 ELSE 0 END) AS presentCount
-        FROM expected ex LEFT JOIN field_scopes fs ON fs.field_id=ex.field_id AND fs.environment_id=?`).bind(environment.projectId,parentId,environment.id).first(),
+      db.prepare(`SELECT
+        (SELECT count(DISTINCT field_id) FROM field_scopes WHERE project_id=? OR project_id=?) AS expectedCount,
+        (SELECT count(DISTINCT field_id) FROM field_scopes WHERE environment_id=?) AS presentCount,
+        (SELECT count(DISTINCT table_id) FROM table_scopes WHERE project_id=? OR project_id=?) AS expectedTableCount,
+        (SELECT count(DISTINCT table_id) FROM table_scopes WHERE environment_id=?) AS presentTableCount`).bind(environment.projectId,parentId,environment.id,environment.projectId,parentId,environment.id).first(),
       db.prepare(`WITH expected AS (SELECT DISTINCT field_id FROM field_scopes WHERE project_id=? OR project_id=?)
         SELECT f.id,f.code,f.name,f.data_type AS dataType,f.comment,t.name AS tableName
         FROM expected ex JOIN catalog_fields f ON f.id=ex.field_id JOIN catalog_tables t ON t.id=f.table_id
@@ -147,16 +183,16 @@ export async function GET(request:Request) {
     return Response.json({ differences:differenceRows.results,imports:historyRows.results });
   }
 
-  const [projects,environments,versions,modules,tables,fieldSummary,imports,repositories] = await db.batch([
+  const [projects,environments,versions,modules,tables,tableSummary,fieldSummary,imports,repositories] = await db.batch([
     db.prepare(`SELECT p.id,p.code,p.name,p.kind,p.parent_id AS parentId,p.icon,p.description,
-      count(DISTINCT e.id) AS environmentCount,count(DISTINCT v.id) AS versionCount,count(DISTINCT fs.field_id) AS fieldCount
+      count(DISTINCT e.id) AS environmentCount,count(DISTINCT v.id) AS versionCount,count(DISTINCT ts.table_id) AS tableCount,count(DISTINCT fs.field_id) AS fieldCount
       FROM catalog_projects p LEFT JOIN catalog_environments e ON e.project_id=p.id AND e.archived=0
-      LEFT JOIN catalog_versions v ON v.project_id=p.id LEFT JOIN field_scopes fs ON fs.project_id=p.id
+      LEFT JOIN catalog_versions v ON v.project_id=p.id LEFT JOIN table_scopes ts ON ts.project_id=p.id LEFT JOIN field_scopes fs ON fs.project_id=p.id
       WHERE p.archived=0 GROUP BY p.id ORDER BY CASE p.kind WHEN 'platform' THEN 0 ELSE 1 END,p.name`),
     db.prepare(`SELECT e.id,e.project_id AS projectId,e.version_id AS versionId,e.code,e.name,e.stage,e.sort_order AS sortOrder,
-      p.name AS projectName,v.name AS versionName,count(DISTINCT fs.field_id) AS fieldCount
+      p.name AS projectName,v.name AS versionName,count(DISTINCT ts.table_id) AS tableCount,count(DISTINCT fs.field_id) AS fieldCount
       FROM catalog_environments e JOIN catalog_projects p ON p.id=e.project_id LEFT JOIN catalog_versions v ON v.id=e.version_id
-      LEFT JOIN field_scopes fs ON fs.environment_id=e.id AND fs.version_id=e.version_id
+      LEFT JOIN table_scopes ts ON ts.environment_id=e.id AND ts.version_id=e.version_id LEFT JOIN field_scopes fs ON fs.environment_id=e.id AND fs.version_id=e.version_id
       WHERE e.archived=0 GROUP BY e.id ORDER BY p.kind DESC,p.name,e.sort_order,e.name`),
     db.prepare(`SELECT v.id,v.project_id AS projectId,v.name,v.source_version AS sourceVersion,v.repository_id AS repositoryId,
       v.git_ref AS gitRef,v.git_commit AS gitCommit,v.status,p.name AS projectName,r.name AS repositoryName,r.repository
@@ -165,9 +201,10 @@ export async function GET(request:Request) {
     db.prepare(`SELECT m.id,m.code,m.name,m.description,count(DISTINCT t.id) AS tableCount,count(DISTINCT pm.project_id) AS projectCount
       FROM catalog_modules m LEFT JOIN catalog_tables t ON t.module_id=m.id LEFT JOIN catalog_project_modules pm ON pm.module_id=m.id
       GROUP BY m.id ORDER BY m.name`),
-    db.prepare(`SELECT t.id,t.code,t.name,t.comment,t.module_id AS moduleId,m.name AS moduleName,count(DISTINCT f.id) AS fieldCount
-      FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN catalog_fields f ON f.table_id=t.id
+    db.prepare(`SELECT t.id,t.code,t.name,t.comment,t.module_id AS moduleId,m.name AS moduleName,count(DISTINCT f.id) AS fieldCount,count(DISTINCT ts.environment_id) AS scopeCount
+      FROM catalog_tables t LEFT JOIN catalog_modules m ON m.id=t.module_id LEFT JOIN catalog_fields f ON f.table_id=t.id LEFT JOIN table_scopes ts ON ts.table_id=t.id
       GROUP BY t.id ORDER BY t.name`),
+    db.prepare(`SELECT count(*) AS count FROM catalog_tables`),
     db.prepare(`SELECT count(*) AS count FROM catalog_fields`),
     db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
       b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
@@ -180,7 +217,7 @@ export async function GET(request:Request) {
       FROM repository_sources r ORDER BY r.created_at DESC`),
   ]);
   return Response.json({ projects:projects.results,environments:environments.results,versions:versions.results,modules:modules.results,
-    tables:tables.results,fields:[],scopes:[],fieldTotal:Number((fieldSummary.results[0] as {count?:number}|undefined)?.count??0),imports:imports.results,repositories:repositories.results });
+    tables:tables.results,fields:[],scopes:[],tableTotal:Number((tableSummary.results[0] as {count?:number}|undefined)?.count??0),fieldTotal:Number((fieldSummary.results[0] as {count?:number}|undefined)?.count??0),imports:imports.results,repositories:repositories.results });
 }
 
 export async function POST(request:Request) {
@@ -235,13 +272,20 @@ export async function POST(request:Request) {
 
   if (action === 'table.save') {
     const recordId=clean(payload.id),name=clean(payload.name).toLowerCase();
+    const projectId=clean(payload.projectId),versionId=clean(payload.versionId);
+    const environmentIds=Array.isArray(payload.environmentIds)?payload.environmentIds.map(clean).filter(Boolean):[];
     if (!name) return Response.json({ error:'请填写表名。' },{ status:400 });
     const codes = new Set((await db.prepare(`SELECT code FROM catalog_tables`).all<{code:string}>()).results.map((item)=>item.code));
     const code=(clean(payload.code)||tableCode(name,codes)).toUpperCase();
     try {
+      const tableId=recordId||id();
       if (recordId) await db.prepare(`UPDATE catalog_tables SET code=?,name=?,comment=?,module_id=? WHERE id=?`).bind(code,name,clean(payload.comment),clean(payload.moduleId)||null,recordId).run();
-      else await db.prepare(`INSERT INTO catalog_tables VALUES (?,?,?,?,?,NULL,?)`).bind(id(),code,name,clean(payload.comment),clean(payload.moduleId)||null,now()).run();
-      return Response.json({ ok:true });
+      else await db.prepare(`INSERT INTO catalog_tables VALUES (?,?,?,?,?,NULL,?)`).bind(tableId,code,name,clean(payload.comment),clean(payload.moduleId)||null,now()).run();
+      if (projectId&&versionId&&environmentIds.length) {
+        if (recordId) await db.prepare(`DELETE FROM table_scopes WHERE table_id=? AND project_id=? AND version_id=?`).bind(tableId,projectId,versionId).run();
+        await runChunked(db,environmentIds.map((environmentId)=>db.prepare(`INSERT OR IGNORE INTO table_scopes VALUES (?,?,?,?, 'present','manual',NULL,?)`).bind(tableId,projectId,versionId,environmentId,now())));
+      }
+      return Response.json({ ok:true,code });
     } catch { return Response.json({ error:'表名或表编码已经存在。' },{ status:409 }); }
   }
 
@@ -260,7 +304,10 @@ export async function POST(request:Request) {
       else await db.prepare(`INSERT INTO catalog_fields VALUES (?,?,?,?,?,?,?,?,?,0,'manual',NULL,?)`).bind(fieldId,tableId,code,name,dataType,payload.nullable===false?0:1,clean(payload.defaultValue)||null,clean(payload.comment),clean(payload.extra),now()).run();
       if (projectId&&versionId&&environmentIds.length) {
         if (recordId) await db.prepare(`DELETE FROM field_scopes WHERE field_id=? AND project_id=? AND version_id=?`).bind(fieldId,projectId,versionId).run();
-        await runChunked(db,environmentIds.map((environmentId)=>db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present','manual',NULL,?)`).bind(fieldId,projectId,versionId,environmentId,now())));
+        await runChunked(db,environmentIds.flatMap((environmentId)=>[
+          db.prepare(`INSERT OR IGNORE INTO table_scopes VALUES (?,?,?,?, 'present','manual',NULL,?)`).bind(tableId,projectId,versionId,environmentId,now()),
+          db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present','manual',NULL,?)`).bind(fieldId,projectId,versionId,environmentId,now()),
+        ]));
       }
       return Response.json({ ok:true,code });
     } catch { return Response.json({ error:'这张表中已经存在同名字段。' },{ status:409 }); }
@@ -365,6 +412,7 @@ export async function POST(request:Request) {
     const batchDate=new Date(Date.now()+8*60*60*1000).toISOString().slice(0,10).replaceAll('-','');
     const batchId=id(),batchCode=`IMP-${batchDate}-${String((batchCount?.count??0)+1).padStart(3,'0')}`;
     const statements:D1PreparedStatement[]=[];
+    const registeredTableScopes=new Set<string>();
     let added=0,duplicates=0,modified=0,removed=0,conflicts=0;
 
     for (const parsedField of parsed.fields) {
@@ -376,6 +424,10 @@ export async function POST(request:Request) {
       } else {
         const tableComment=parsedTableMap.get(parsedField.tableName)?.comment;
         if (tableComment&&!table.comment) { statements.push(db.prepare(`UPDATE catalog_tables SET comment=? WHERE id=?`).bind(tableComment,table.id)); table.comment=tableComment; }
+      }
+      if (!registeredTableScopes.has(table.id)) {
+        environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO table_scopes VALUES (?,?,?,?, 'present',?,?,?)`).bind(table.id,projectId,versionId,environmentId,sourceKind,batchId,now())));
+        registeredTableScopes.add(table.id);
       }
       const key=`${parsedField.tableName}.${(parsedField.previousName||parsedField.columnName).toLowerCase()}`;
       const existing=fieldMap.get(key);
@@ -427,7 +479,10 @@ export async function POST(request:Request) {
     const batchId=clean(payload.id); if (!batchId) return Response.json({ error:'导入批次无效。' },{ status:400 });
     const fields=(await db.prepare(`SELECT id FROM catalog_fields WHERE import_batch_id=?`).bind(batchId).all<{id:string}>()).results;
     const items=(await db.prepare(`SELECT action,table_name AS tableName,column_name AS columnName,field_id AS fieldId,result,fingerprint,before_snapshot AS beforeSnapshot FROM import_items WHERE batch_id=? ORDER BY statement_no DESC,id DESC`).bind(batchId).all<{action:string;tableName:string;columnName:string;fieldId:string|null;result:string;fingerprint:string;beforeSnapshot:string|null}>()).results;
-    await db.prepare(`DELETE FROM field_scopes WHERE import_batch_id=?`).bind(batchId).run();
+    await db.batch([
+      db.prepare(`DELETE FROM field_scopes WHERE import_batch_id=?`).bind(batchId),
+      db.prepare(`DELETE FROM table_scopes WHERE import_batch_id=?`).bind(batchId),
+    ]);
     let skipped=0;
     for (const item of items) {
       if (!item.beforeSnapshot) continue;
@@ -450,7 +505,7 @@ export async function POST(request:Request) {
   }
 
   if (action === 'catalog.reset') {
-    await db.batch([db.prepare(`DELETE FROM field_scopes`),db.prepare(`DELETE FROM import_items`),db.prepare(`DELETE FROM import_batch_environments`),db.prepare(`DELETE FROM import_batches`),db.prepare(`DELETE FROM catalog_fields`),db.prepare(`DELETE FROM catalog_tables`)]);
+    await db.batch([db.prepare(`DELETE FROM field_scopes`),db.prepare(`DELETE FROM table_scopes`),db.prepare(`DELETE FROM import_items`),db.prepare(`DELETE FROM import_batch_environments`),db.prepare(`DELETE FROM import_batches`),db.prepare(`DELETE FROM catalog_fields`),db.prepare(`DELETE FROM catalog_tables`)]);
     return Response.json({ ok:true });
   }
 

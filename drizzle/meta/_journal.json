@@ -43,6 +43,13 @@
       "when": 1787469977280,
       "tag": "0005_flashy_silver_surfer",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1787581453625,
+      "tag": "0006_gigantic_redwing",
+      "breakpoints": true
     }
   ]
 }
