@@ -50,6 +50,13 @@
       "when": 1787581453625,
       "tag": "0006_gigantic_redwing",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1787674445002,
+      "tag": "0007_gifted_lilith",
+      "breakpoints": true
     }
   ]
 }

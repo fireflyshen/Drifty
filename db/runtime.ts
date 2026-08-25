@@ -21,6 +21,14 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS idx_table_scopes_environment ON table_scopes(environment_id)`,
   `CREATE TABLE IF NOT EXISTS field_scopes (field_id text NOT NULL, project_id text NOT NULL, version_id text NOT NULL, environment_id text NOT NULL, state text DEFAULT 'present' NOT NULL, origin text DEFAULT 'manual' NOT NULL, import_batch_id text, created_at text NOT NULL, PRIMARY KEY(field_id,version_id,environment_id), FOREIGN KEY(field_id) REFERENCES catalog_fields(id) ON DELETE CASCADE, FOREIGN KEY(project_id) REFERENCES catalog_projects(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_field_scopes_environment ON field_scopes(environment_id)`,
+  `CREATE TABLE IF NOT EXISTS catalog_field_revisions (id text PRIMARY KEY NOT NULL, field_id text NOT NULL, revision integer NOT NULL, data_type text NOT NULL, nullable integer DEFAULT 1 NOT NULL, default_value text, comment text DEFAULT '' NOT NULL, extra text DEFAULT '' NOT NULL, ordinal integer DEFAULT 0 NOT NULL, source_kind text DEFAULT 'manual' NOT NULL, import_batch_id text, fingerprint text NOT NULL, created_at text NOT NULL, FOREIGN KEY(field_id) REFERENCES catalog_fields(id) ON DELETE CASCADE, UNIQUE(field_id,revision))`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_field_revisions_field ON catalog_field_revisions(field_id)`,
+  `CREATE TABLE IF NOT EXISTS catalog_field_scope_revisions (field_id text NOT NULL, version_id text NOT NULL, environment_id text NOT NULL, revision_id text NOT NULL, updated_at text NOT NULL, PRIMARY KEY(field_id,version_id,environment_id), FOREIGN KEY(field_id) REFERENCES catalog_fields(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE, FOREIGN KEY(revision_id) REFERENCES catalog_field_revisions(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_field_scope_revisions_revision ON catalog_field_scope_revisions(revision_id)`,
+  `CREATE TABLE IF NOT EXISTS catalog_changes (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, action text NOT NULL, table_name text NOT NULL, field_name text NOT NULL, field_id text, project_id text NOT NULL, version_id text NOT NULL, source_kind text NOT NULL, source_path text, git_commit text, sql_text text NOT NULL, import_batch_id text, status text DEFAULT 'planned' NOT NULL, created_at text NOT NULL, FOREIGN KEY(field_id) REFERENCES catalog_fields(id) ON DELETE SET NULL, FOREIGN KEY(project_id) REFERENCES catalog_projects(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_changes_version ON catalog_changes(version_id)`,
+  `CREATE TABLE IF NOT EXISTS catalog_change_scopes (change_id text NOT NULL, environment_id text NOT NULL, status text DEFAULT 'pending' NOT NULL, executed_at text, verified_at text, note text DEFAULT '' NOT NULL, PRIMARY KEY(change_id,environment_id), FOREIGN KEY(change_id) REFERENCES catalog_changes(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_change_scopes_environment ON catalog_change_scopes(environment_id)`,
   `CREATE TABLE IF NOT EXISTS import_batches (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, source_kind text NOT NULL, file_name text, source_path text, git_commit text, fingerprint text NOT NULL, raw_sql text DEFAULT '' NOT NULL, project_id text NOT NULL, version_id text NOT NULL, module_id text, status text DEFAULT 'active' NOT NULL, added_count integer DEFAULT 0 NOT NULL, duplicate_count integer DEFAULT 0 NOT NULL, modified_count integer DEFAULT 0 NOT NULL, removed_count integer DEFAULT 0 NOT NULL, conflict_count integer DEFAULT 0 NOT NULL, created_at text NOT NULL, reverted_at text, FOREIGN KEY(project_id) REFERENCES catalog_projects(id), FOREIGN KEY(version_id) REFERENCES catalog_versions(id), FOREIGN KEY(module_id) REFERENCES catalog_modules(id))`,
   `CREATE TABLE IF NOT EXISTS import_items (id text PRIMARY KEY NOT NULL, batch_id text NOT NULL, statement_no integer NOT NULL, action text NOT NULL, table_name text NOT NULL, column_name text NOT NULL, field_id text, result text NOT NULL, message text DEFAULT '' NOT NULL, fingerprint text NOT NULL, before_snapshot text, FOREIGN KEY(batch_id) REFERENCES import_batches(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_items(batch_id)`,
@@ -73,11 +81,12 @@ export function getD1() { if (!env.DB) throw new Error('Cloudflare D1 binding `D
 export async function ensureDatabase() {
   const db = getD1();
   await db.batch(statements.map((sql) => db.prepare(sql)));
-  const [projectColumns,versionColumns,importColumns,importItemColumns] = await Promise.all([
+  const [projectColumns,versionColumns,importColumns,importItemColumns,changeColumns] = await Promise.all([
     db.prepare(`PRAGMA table_info(catalog_projects)`).all<{name:string}>(),
     db.prepare(`PRAGMA table_info(catalog_versions)`).all<{name:string}>(),
     db.prepare(`PRAGMA table_info(import_batches)`).all<{name:string}>(),
     db.prepare(`PRAGMA table_info(import_items)`).all<{name:string}>(),
+    db.prepare(`PRAGMA table_info(catalog_changes)`).all<{name:string}>(),
   ]);
   const alterations:D1PreparedStatement[]=[];
   if (!projectColumns.results.some((column) => column.name === 'icon')) alterations.push(db.prepare(`ALTER TABLE catalog_projects ADD COLUMN icon text DEFAULT 'boxes' NOT NULL`));
@@ -90,6 +99,7 @@ export async function ensureDatabase() {
   if (!importColumns.results.some((column) => column.name === 'modified_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN modified_count integer DEFAULT 0 NOT NULL`));
   if (!importColumns.results.some((column) => column.name === 'removed_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN removed_count integer DEFAULT 0 NOT NULL`));
   if (!importItemColumns.results.some((column) => column.name === 'before_snapshot')) alterations.push(db.prepare(`ALTER TABLE import_items ADD COLUMN before_snapshot text`));
+  if (!changeColumns.results.some((column) => column.name === 'import_batch_id')) alterations.push(db.prepare(`ALTER TABLE catalog_changes ADD COLUMN import_batch_id text`));
   if (alterations.length) await db.batch(alterations);
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_versions_repository ON catalog_versions(repository_id)`).run();
   const tableScopeMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='table_scope_backfill_v1'`).first();
@@ -99,6 +109,17 @@ export async function ensureDatabase() {
       db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('table_scope_backfill_v1','1')`),
     ]);
   }
+  // Existing catalog data predates revisioned definitions. Create a stable baseline revision
+  // and point every existing scope at it; later imports create new revisions instead of
+  // rewriting the definition that another environment still uses.
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO catalog_field_revisions (id,field_id,revision,data_type,nullable,default_value,comment,extra,ordinal,source_kind,import_batch_id,fingerprint,created_at)
+      SELECT f.id || ':r1',f.id,1,f.data_type,f.nullable,f.default_value,f.comment,f.extra,f.ordinal,f.source_kind,f.import_batch_id,
+        lower(f.name)||'|'||lower(f.data_type)||'|'||f.nullable||'|'||coalesce(f.default_value,'')||'|'||f.comment||'|'||f.extra,f.created_at
+      FROM catalog_fields f`),
+    db.prepare(`INSERT OR IGNORE INTO catalog_field_scope_revisions (field_id,version_id,environment_id,revision_id,updated_at)
+      SELECT fs.field_id,fs.version_id,fs.environment_id,fs.field_id || ':r1',fs.created_at FROM field_scopes fs`),
+  ]);
   const seedMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='initial_seed'`).first();
   if (!seedMarker) {
     await db.batch([
@@ -106,5 +127,13 @@ export async function ensureDatabase() {
       db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('initial_seed','1')`),
     ]);
   }
+  // Run once more after first-run seeds so the seeded catalog is revisioned immediately.
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO catalog_field_revisions (id,field_id,revision,data_type,nullable,default_value,comment,extra,ordinal,source_kind,import_batch_id,fingerprint,created_at)
+      SELECT f.id || ':r1',f.id,1,f.data_type,f.nullable,f.default_value,f.comment,f.extra,f.ordinal,f.source_kind,f.import_batch_id,
+        lower(f.name)||'|'||lower(f.data_type)||'|'||f.nullable||'|'||coalesce(f.default_value,'')||'|'||f.comment||'|'||f.extra,f.created_at FROM catalog_fields f`),
+    db.prepare(`INSERT OR IGNORE INTO catalog_field_scope_revisions (field_id,version_id,environment_id,revision_id,updated_at)
+      SELECT fs.field_id,fs.version_id,fs.environment_id,fs.field_id || ':r1',fs.created_at FROM field_scopes fs`),
+  ]);
   return db;
 }

@@ -96,6 +96,37 @@ export const fieldScopes = sqliteTable('field_scopes', {
   state: text('state').notNull().default('present'), origin: text('origin').notNull().default('manual'), importBatchId: text('import_batch_id'), createdAt: text('created_at').notNull(),
 }, (table) => [primaryKey({ columns:[table.fieldId, table.versionId, table.environmentId] }), index('idx_field_scopes_environment').on(table.environmentId)]);
 
+// A field is a stable logical object; its SQL definition is versioned separately.
+// This keeps dev/test/prod honest when a MODIFY COLUMN has only rolled out to some environments.
+export const catalogFieldRevisions = sqliteTable('catalog_field_revisions', {
+  id: text('id').primaryKey(), fieldId: text('field_id').notNull().references(() => catalogFields.id, { onDelete:'cascade' }),
+  revision: integer('revision').notNull(), dataType: text('data_type').notNull(), nullable: integer('nullable').notNull().default(1),
+  defaultValue: text('default_value'), comment: text('comment').notNull().default(''), extra: text('extra').notNull().default(''),
+  ordinal: integer('ordinal').notNull().default(0), sourceKind: text('source_kind').notNull().default('manual'), importBatchId: text('import_batch_id'),
+  fingerprint: text('fingerprint').notNull(), createdAt: text('created_at').notNull(),
+}, (table) => [uniqueIndex('uq_catalog_field_revisions_field_revision').on(table.fieldId, table.revision), index('idx_catalog_field_revisions_field').on(table.fieldId)]);
+
+export const catalogFieldScopeRevisions = sqliteTable('catalog_field_scope_revisions', {
+  fieldId: text('field_id').notNull().references(() => catalogFields.id, { onDelete:'cascade' }),
+  versionId: text('version_id').notNull().references(() => catalogVersions.id, { onDelete:'cascade' }),
+  environmentId: text('environment_id').notNull().references(() => catalogEnvironments.id, { onDelete:'cascade' }),
+  revisionId: text('revision_id').notNull().references(() => catalogFieldRevisions.id, { onDelete:'cascade' }),
+  updatedAt: text('updated_at').notNull(),
+}, (table) => [primaryKey({ columns:[table.fieldId, table.versionId, table.environmentId] }), index('idx_catalog_field_scope_revisions_revision').on(table.revisionId)]);
+
+export const catalogChanges = sqliteTable('catalog_changes', {
+  id: text('id').primaryKey(), code: text('code').notNull().unique(), name: text('name').notNull(), action: text('action').notNull(),
+  tableName: text('table_name').notNull(), fieldName: text('field_name').notNull(), fieldId: text('field_id'), projectId: text('project_id').notNull(),
+  versionId: text('version_id').notNull(), sourceKind: text('source_kind').notNull(), sourcePath: text('source_path'), gitCommit: text('git_commit'),
+  sqlText: text('sql_text').notNull(), importBatchId: text('import_batch_id'), status: text('status').notNull().default('planned'), createdAt: text('created_at').notNull(),
+}, (table) => [index('idx_catalog_changes_version').on(table.versionId), index('idx_catalog_changes_field').on(table.fieldId)]);
+
+export const catalogChangeScopes = sqliteTable('catalog_change_scopes', {
+  changeId: text('change_id').notNull().references(() => catalogChanges.id, { onDelete:'cascade' }),
+  environmentId: text('environment_id').notNull().references(() => catalogEnvironments.id, { onDelete:'cascade' }),
+  status: text('status').notNull().default('pending'), executedAt: text('executed_at'), verifiedAt: text('verified_at'), note: text('note').notNull().default(''),
+}, (table) => [primaryKey({ columns:[table.changeId, table.environmentId] }), index('idx_catalog_change_scopes_environment').on(table.environmentId)]);
+
 export const importBatches = sqliteTable('import_batches', {
   id: text('id').primaryKey(), code: text('code').notNull().unique(), name: text('name').notNull(), sourceKind: text('source_kind').notNull(),
   fileName: text('file_name'), sourcePath: text('source_path'), gitCommit: text('git_commit'), fingerprint: text('fingerprint').notNull(), rawSql: text('raw_sql').notNull().default(''), projectId: text('project_id').notNull().references(() => catalogProjects.id),
