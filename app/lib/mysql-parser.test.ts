@@ -62,3 +62,26 @@ test('ignores common MySQL dump wrapper statements', () => {
   assert.equal(result.fields.length,1);
   assert.deepEqual(result.warnings,[]);
 });
+
+test('parses indexes from CREATE and ALTER TABLE', () => {
+  const result=parseMysqlSql(`
+    CREATE TABLE mes_order (
+      id bigint NOT NULL,
+      customer_id bigint,
+      KEY idx_customer (customer_id),
+      UNIQUE KEY uk_order_id (id)
+    );
+    ALTER TABLE mes_order ADD INDEX idx_customer_status (customer_id, id), DROP INDEX old_idx;
+  `);
+  assert.deepEqual(result.indexes.map((index)=>[index.action,index.name,index.kind,index.columns]),[
+    ['add','idx_customer','index',['customer_id']],
+    ['add','uk_order_id','unique',['id']],
+    ['add','idx_customer_status','index',['customer_id','id']],
+    ['drop','old_idx','index',[]],
+  ]);
+});
+
+test('parses foreign key and check constraints', () => {
+  const result=parseMysqlSql(`CREATE TABLE mes_order (id bigint, customer_id bigint, CONSTRAINT fk_order_customer FOREIGN KEY (customer_id) REFERENCES customer(id), CONSTRAINT ck_order_id CHECK (id > 0));`);
+  assert.deepEqual(result.constraints.map((item)=>[item.kind,item.name]),[['foreign','fk_order_customer'],['check','ck_order_id']]);
+});

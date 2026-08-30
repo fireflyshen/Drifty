@@ -13,7 +13,9 @@ export type ParsedField = {
 };
 
 export type ParsedTable = { name:string; comment:string };
-export type ParseResult = { fields:ParsedField[]; tables:ParsedTable[]; warnings:string[] };
+export type ParsedIndex = { action:'add'|'drop'; tableName:string; name:string; kind:'primary'|'unique'|'index'|'fulltext'|'spatial'; columns:string[]; statementNo:number };
+export type ParsedConstraint = { action:'add'|'drop'; tableName:string; name:string; kind:'foreign'|'check'; definition:string; statementNo:number };
+export type ParseResult = { fields:ParsedField[]; tables:ParsedTable[]; indexes:ParsedIndex[]; constraints:ParsedConstraint[]; warnings:string[] };
 
 function splitTopLevel(value:string, separator=',') {
   const parts:string[] = [];
@@ -109,6 +111,8 @@ function parseDefinition(definition:string, context:{tableName:string;action:Par
 export function parseMysqlSql(sql:string):ParseResult {
   const fields:ParsedField[] = [];
   const tables:ParsedTable[] = [];
+  const indexes:ParsedIndex[] = [];
+  const constraints:ParsedConstraint[] = [];
   const warnings:string[] = [];
   const statements = splitStatements(sql);
 
@@ -121,7 +125,17 @@ export function parseMysqlSql(sql:string):ParseResult {
       tables.push({ name:tableName,comment:tableComment?unquote(tableComment[1]):'' });
       let ordinal = 0;
       splitTopLevel(create[2]).forEach((definition) => {
-        if (/^(?:PRIMARY|UNIQUE|KEY|INDEX|CONSTRAINT|FOREIGN|CHECK|FULLTEXT|SPATIAL)\b/i.test(definition)) return;
+        const index=definition.match(/^(PRIMARY\s+KEY|UNIQUE\s+(?:KEY|INDEX)|(?:FULLTEXT|SPATIAL)\s+(?:KEY|INDEX)|(?:KEY|INDEX))\s*(?:`?([A-Za-z0-9_$]+)`?)?\s*\(([^)]*)\)/i);
+        if (index) {
+          const rawKind=index[1].toLowerCase();
+          const kind=rawKind.startsWith('primary')?'primary':rawKind.startsWith('unique')?'unique':rawKind.startsWith('fulltext')?'fulltext':rawKind.startsWith('spatial')?'spatial':'index';
+          const name=kind==='primary'?'PRIMARY':index[2]||`idx_${tableName}_${indexes.length+1}`;
+          indexes.push({action:'add',tableName,name,kind,columns:splitTopLevel(index[3]).map((column)=>column.trim().replace(/^`|`$/g,'').replace(/\s+(?:ASC|DESC)\b/i,'').trim()).filter(Boolean),statementNo});
+          return;
+        }
+        const foreign=definition.match(/^(?:CONSTRAINT\s+`?([A-Za-z0-9_$]+)`?\s+)?FOREIGN\s+KEY[\s\S]*$/i);
+        const check=definition.match(/^(?:CONSTRAINT\s+`?([A-Za-z0-9_$]+)`?\s+)?CHECK\s*\([\s\S]*$/i);
+        if (foreign||check) { constraints.push({action:'add',tableName,name:foreign?.[1]||check?.[1]||`${foreign?'fk':'ck'}_${tableName}_${constraints.length+1}`,kind:foreign?'foreign':'check',definition:definition.trim(),statementNo}); return; }
         ordinal += 1;
         const parsed = parseDefinition(definition, { tableName, action:'add', statementNo, ordinal });
         if (parsed) fields.push(parsed); else warnings.push(`第 ${statementNo} 条语句中有一行字段定义无法识别：${definition.slice(0,80)}`);
@@ -133,6 +147,20 @@ export function parseMysqlSql(sql:string):ParseResult {
     if (alter) {
       const tableName = alter[1].toLowerCase();
       splitTopLevel(alter[2]).forEach((clause, clauseIndex) => {
+        const addIndex=clause.match(/^ADD\s+(?:(UNIQUE|FULLTEXT|SPATIAL)\s+)?(?:KEY|INDEX)\s*`?([A-Za-z0-9_$]+)`?\s*\(([^)]*)\)/i);
+        const primaryIndex=clause.match(/^ADD\s+PRIMARY\s+KEY\s*\(([^)]*)\)/i);
+        const dropIndex=clause.match(/^DROP\s+(?:INDEX|KEY)\s+`?([A-Za-z0-9_$]+)`?/i);
+        const addConstraint=clause.match(/^ADD\s+(?:CONSTRAINT\s+`?([A-Za-z0-9_$]+)`?\s+)?(FOREIGN\s+KEY|CHECK)\b([\s\S]*)$/i);
+        const dropConstraint=clause.match(/^DROP\s+FOREIGN\s+KEY\s+`?([A-Za-z0-9_$]+)`?/i);
+        if (addConstraint) { const kind=addConstraint[2].toLowerCase().startsWith('foreign')?'foreign':'check'; constraints.push({action:'add',tableName,name:addConstraint[1]||`${kind==='foreign'?'fk':'ck'}_${tableName}_${constraints.length+1}`,kind,definition:clause.trim(),statementNo}); return; }
+        if (dropConstraint) { constraints.push({action:'drop',tableName,name:dropConstraint[1],kind:'foreign',definition:'',statementNo}); return; }
+        if (primaryIndex||addIndex) {
+          const columns=splitTopLevel((primaryIndex?.[1]??addIndex?.[3]??'')).map((column)=>column.trim().replace(/^`|`$/g,'').replace(/\s+(?:ASC|DESC)\b/i,'').trim()).filter(Boolean);
+          const rawKind=addIndex?.[1]?.toLowerCase()??'';
+          indexes.push({action:'add',tableName,name:primaryIndex?'PRIMARY':addIndex?.[2]??`idx_${tableName}_${indexes.length+1}`,kind:primaryIndex?'primary':rawKind==='unique'?'unique':rawKind==='fulltext'?'fulltext':rawKind==='spatial'?'spatial':'index',columns,statementNo});
+          return;
+        }
+        if (dropIndex) { indexes.push({action:'drop',tableName,name:dropIndex[1],kind:'index',columns:[],statementNo}); return; }
         const add = clause.match(/^ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([\s\S]+)$/i);
         const modify = clause.match(/^MODIFY\s+(?:COLUMN\s+)?([\s\S]+)$/i);
         const change = clause.match(/^CHANGE\s+(?:COLUMN\s+)?`?([A-Za-z0-9_$]+)`?\s+([\s\S]+)$/i);
@@ -160,7 +188,7 @@ export function parseMysqlSql(sql:string):ParseResult {
     warnings.push(`第 ${statementNo} 条语句不是受支持的 CREATE TABLE 或 ALTER TABLE。`);
   });
 
-  return { fields, tables, warnings };
+  return { fields, tables, indexes, constraints, warnings };
 }
 
 export function fieldFingerprint(field:Pick<ParsedField,'tableName'|'columnName'|'dataType'|'nullable'|'defaultValue'|'comment'|'extra'>) {

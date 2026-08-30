@@ -57,6 +57,20 @@
       "when": 1787674445002,
       "tag": "0007_gifted_lilith",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1787932800000,
+      "tag": "0008_project_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1788019200000,
+      "tag": "0009_scope_conflict_resolution",
+      "breakpoints": true
     }
   ]
 }

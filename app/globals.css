@@ -5,7 +5,9 @@
 @custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
 
 :root {
-  --radius: .75rem;
+  --radius: .625rem;
+  --motion-fast: 140ms;
+  --motion-base: 200ms;
   --background: oklch(.985 0 0);
   --foreground: oklch(.145 0 0);
   --card: oklch(1 0 0);
@@ -24,6 +26,14 @@
   --border: oklch(.922 0 0);
   --input: oklch(.922 0 0);
   --ring: oklch(.708 0 0);
+  --diff-added: oklch(.57 .17 151);
+  --diff-added-bg: oklch(.96 .035 151);
+  --diff-modified: oklch(.55 .19 257);
+  --diff-modified-bg: oklch(.96 .03 257);
+  --diff-removed: oklch(.58 .21 27);
+  --diff-removed-bg: oklch(.96 .035 27);
+  --diff-conflict: oklch(.63 .16 75);
+  --diff-conflict-bg: oklch(.97 .04 75);
 }
 
 [data-theme='dark'] {
@@ -45,6 +55,14 @@
   --border: oklch(1 0 0 / 11%);
   --input: oklch(1 0 0 / 14%);
   --ring: oklch(.556 0 0);
+  --diff-added: oklch(.72 .18 151);
+  --diff-added-bg: oklch(.28 .045 151);
+  --diff-modified: oklch(.73 .15 257);
+  --diff-modified-bg: oklch(.27 .045 257);
+  --diff-removed: oklch(.72 .18 27);
+  --diff-removed-bg: oklch(.28 .05 27);
+  --diff-conflict: oklch(.78 .15 75);
+  --diff-conflict-bg: oklch(.29 .05 75);
   color-scheme: dark;
 }
 
@@ -68,6 +86,14 @@
     --border: oklch(1 0 0 / 11%);
     --input: oklch(1 0 0 / 14%);
     --ring: oklch(.556 0 0);
+    --diff-added: oklch(.72 .18 151);
+    --diff-added-bg: oklch(.28 .045 151);
+    --diff-modified: oklch(.73 .15 257);
+    --diff-modified-bg: oklch(.27 .045 257);
+    --diff-removed: oklch(.72 .18 27);
+    --diff-removed-bg: oklch(.28 .05 27);
+    --diff-conflict: oklch(.78 .15 75);
+    --diff-conflict-bg: oklch(.29 .05 75);
     color-scheme: dark;
   }
 }
@@ -92,6 +118,14 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-diff-added: var(--diff-added);
+  --color-diff-added-bg: var(--diff-added-bg);
+  --color-diff-modified: var(--diff-modified);
+  --color-diff-modified-bg: var(--diff-modified-bg);
+  --color-diff-removed: var(--diff-removed);
+  --color-diff-removed-bg: var(--diff-removed-bg);
+  --color-diff-conflict: var(--diff-conflict);
+  --color-diff-conflict-bg: var(--diff-conflict-bg);
   --radius-sm: calc(var(--radius) * .65);
   --radius-md: calc(var(--radius) * .82);
   --radius-lg: var(--radius);
@@ -104,4 +138,47 @@
   html { @apply bg-background font-sans; }
   body { @apply m-0 bg-background text-foreground antialiased; }
   button:not(:disabled), [role='button']:not(:disabled) { cursor: pointer; }
+  ::selection { background: color-mix(in oklch, var(--diff-modified) 22%, transparent); }
+}
+
+@layer components {
+  [data-slot='button'],
+  [data-slot='input'],
+  [data-slot='textarea'],
+  [data-slot='select-trigger'],
+  [data-slot='card'] {
+    transition-duration: var(--motion-fast);
+    transition-timing-function: cubic-bezier(.2,.8,.2,1);
+  }
+
+  [data-slot='card'] {
+    box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 4%, transparent);
+  }
+
+  .drifty-view-enter {
+    animation: drifty-view-enter var(--motion-base) cubic-bezier(.2,.8,.2,1) both;
+  }
+
+  .drifty-toast-enter {
+    animation: drifty-toast-enter var(--motion-base) cubic-bezier(.2,.8,.2,1) both;
+  }
+}
+
+@keyframes drifty-view-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes drifty-toast-enter {
+  from { opacity: 0; transform: translate(-50%, -6px) scale(.98); }
+  to { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
 }
