@@ -57,7 +57,6 @@ export default defineConfig(async ({ command }) => {
         config: command === 'build' 
           ? {
               main: 'vinext/server/app-router-entry',
-              compatibility_flags: ['nodejs_compat']
             }
           : localBindingConfig,
       }),
