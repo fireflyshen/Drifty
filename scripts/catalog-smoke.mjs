@@ -16,16 +16,34 @@ try {
   await request('version.save',{projectId,name:'smoke-1'});
   const versionId=(await catalog()).versions.find(version=>version.projectId===projectId&&version.name==='smoke-1').id;
   await request('environment.save',{projectId,versionId,name:'验证环境',code:'smoke',stage:'testing',sortOrder:10});
-  const environmentId=(await catalog()).environments.find(environment=>environment.projectId===projectId&&environment.code==='smoke').id;
+  await request('environment.save',{projectId,versionId,name:'对照环境',code:'smoke-peer',stage:'development',sortOrder:20});
+  const smokeEnvironments=(await catalog()).environments.filter(environment=>environment.projectId===projectId);
+  const environmentId=smokeEnvironments.find(environment=>environment.code==='smoke').id;
+  const peerEnvironmentId=smokeEnvironments.find(environment=>environment.code==='smoke-peer').id;
 
-  const created=await request('import.sql',{name:'多表建表',sql:`
+  const snapshotSql=`
     CREATE TABLE drifty_smoke_customer (id bigint NOT NULL, name varchar(80));
     CREATE TABLE drifty_smoke_order (id bigint NOT NULL, customer_id bigint NOT NULL);
-  `,sourceKind:'paste',projectId,versionId,environmentIds:[environmentId]});
+  `;
+  const created=await request('import.sql',{name:'多表建表',sql:snapshotSql,sourceKind:'paste',projectId,versionId,environmentIds:[environmentId]});
   assert.equal(created.added,4);
+  const createdPeer=await request('import.sql',{name:'对照环境快照',sql:snapshotSql,sourceKind:'paste',projectId,versionId,environmentIds:[peerEnvironmentId]});
+  assert.equal(createdPeer.added,4);
+  assert.notEqual(created.batchCode,createdPeer.batchCode);
+  const releaseAfterSnapshots=await fetch(`${origin}/api/catalog?mode=release&projectId=${projectId}`).then(response=>response.json());
+  assert.equal(releaseAfterSnapshots.changes.length,0);
+  const snapshotHistory=await request('sql.history',{projectId});
+  assert.equal(snapshotHistory.executions.length,2);
+  assert.equal(snapshotHistory.executions.every(execution=>execution.status==='verified'),true);
 
   const added=await request('import.sql',{name:'添加字段',sql:'ALTER TABLE drifty_smoke_customer ADD COLUMN region varchar(40);',sourceKind:'paste',projectId,versionId,environmentIds:[environmentId]});
   assert.equal(added.added,1);
+  const releaseAfterAlter=await fetch(`${origin}/api/catalog?mode=release&projectId=${projectId}`).then(response=>response.json());
+  assert.equal(releaseAfterAlter.changes.length,1);
+  assert.equal(releaseAfterAlter.changes[0].pendingCount,1);
+  const projectInsight=await fetch(`${origin}/api/catalog?mode=project&projectId=${projectId}`).then(response=>response.json());
+  const peerCoverage=projectInsight.coverage.find(item=>item.environmentId===peerEnvironmentId);
+  assert.equal(Number(peerCoverage.expectedCount)-Number(peerCoverage.presentCount),1);
   const modified=await request('import.sql',{name:'修改字段',sql:'ALTER TABLE drifty_smoke_customer MODIFY COLUMN name varchar(120) NOT NULL;',sourceKind:'paste',projectId,versionId,environmentIds:[environmentId]});
   assert.equal(modified.modified,1);
   const changed=await request('import.sql',{name:'重命名字段',sql:'ALTER TABLE drifty_smoke_customer CHANGE COLUMN region area varchar(50);',sourceKind:'paste',projectId,versionId,environmentIds:[environmentId]});
@@ -55,7 +73,9 @@ try {
   await request('import.revert',{id:imports.find(batch=>batch.code===modified.batchCode).id});
   const restoredName=await fetch(`${origin}/api/catalog?mode=search&q=drifty_smoke_customer.name&environmentId=${environmentId}`).then(response=>response.json());
   assert.equal(restoredName.fields[0].dataType,'varchar(80)');
-  console.log(JSON.stringify({created,added,modified,changed,removed,search:{total:first.total,page1:first.fields.length,page2:second.fields.length,tables:tableSearch.total},revert:'ok'}));
+  const historyAfterRevert=await request('sql.history',{projectId});
+  assert.equal(historyAfterRevert.executions.find(execution=>execution.importBatchId===imports.find(batch=>batch.code===modified.batchCode).id).status,'waived');
+  console.log(JSON.stringify({created,createdPeer,releaseAfterSnapshots:releaseAfterSnapshots.changes.length,releaseAfterAlter:releaseAfterAlter.changes.length,coverageGap:Number(peerCoverage.expectedCount)-Number(peerCoverage.presentCount),added,modified,changed,removed,search:{total:first.total,page1:first.fields.length,page2:second.fields.length,tables:tableSearch.total},revert:'ok'}));
 } finally {
   if(projectId)await request('entity.delete',{entity:'project',id:projectId});
 }

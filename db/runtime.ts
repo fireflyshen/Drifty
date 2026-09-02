@@ -153,6 +153,25 @@ export async function ensureDatabase() {
       db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('project_lifecycle_backfill_v1','1')`),
     ]);
   }
+  // Older builds registered pure CREATE snapshots as pending rollout work.
+  // A snapshot is evidence of the structure that already exists in the selected
+  // environment, not a migration that still needs to be executed elsewhere.
+  const baselineImportMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='baseline_import_cleanup_v2'`).first();
+  if (!baselineImportMarker) {
+    const verifiedAt=new Date().toISOString();
+    const baselineBatches=`SELECT b.id FROM import_batches b
+      WHERE lower(coalesce(b.raw_sql,'')) LIKE '%create table%'
+        AND NOT EXISTS (
+          SELECT 1 FROM import_items bi
+          WHERE bi.batch_id=b.id AND (lower(bi.action)<>'add' OR bi.result='conflict')
+        )`;
+    await db.batch([
+      db.prepare(`UPDATE catalog_sql_executions SET status='verified',started_at=coalesce(started_at,?),finished_at=coalesce(finished_at,?),note='初始化快照已确认该环境结构存在。' WHERE import_batch_id IN (${baselineBatches})`).bind(verifiedAt,verifiedAt),
+      db.prepare(`DELETE FROM catalog_change_scopes WHERE change_id IN (SELECT id FROM catalog_changes WHERE import_batch_id IN (${baselineBatches}))`),
+      db.prepare(`DELETE FROM catalog_changes WHERE import_batch_id IN (${baselineBatches})`),
+      db.prepare(`INSERT OR REPLACE INTO runtime_meta (key,value) VALUES ('baseline_import_cleanup_v2',?)`).bind(verifiedAt),
+    ]);
+  }
   // Existing catalog data predates revisioned definitions. Create a stable baseline revision
   // and point every existing scope at it; later imports create new revisions instead of
   // rewriting the definition that another environment still uses.

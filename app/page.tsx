@@ -378,6 +378,12 @@ type ScopePreview = {
     columnsJson: string;
     result: "added" | "modified" | "removed" | "unchanged";
   }[];
+  constraintItems?: {
+    name: string;
+    kind: string;
+    definition: string;
+    result: "added" | "modified" | "removed" | "unchanged";
+  }[];
 };
 type CompareFocus = {
   kind: "all" | "table" | "field";
@@ -472,6 +478,12 @@ type ProjectDifference = {
 type ProjectInsight = {
   differences: ProjectDifference[];
   imports: ImportBatch[];
+  coverage: {
+    environmentId: string;
+    environmentName: string;
+    expectedCount: number;
+    presentCount: number;
+  }[];
 };
 type AnchorTarget = { versionId: string; environmentId: string };
 type AnchorDiffItem = { tableName: string; columnName?: string; result: "added" | "modified" | "removed"; before: string | null; after: string | null; changes: string[] };
@@ -4270,6 +4282,7 @@ function ProjectDetail({
   const [insight, setInsight] = useState<ProjectInsight>({
     differences: [],
     imports: [],
+    coverage: [],
   });
   const [loading, setLoading] = useState(true);
   const [historyQuery, setHistoryQuery] = useState("");
@@ -4287,7 +4300,7 @@ function ProjectDetail({
       .then(setInsight)
       .catch((error) => {
         if ((error as Error).name !== "AbortError")
-          setInsight({ differences: [], imports: [] });
+          setInsight({ differences: [], imports: [], coverage: [] });
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -4297,7 +4310,6 @@ function ProjectDetail({
   useEffect(() => {
     contentRef.current?.scrollTo({ top: 0 });
   }, [project.id, tab]);
-  const differences = insight.differences;
   const imports = insight.imports;
   const normalizedHistoryQuery = historyQuery.trim().toLowerCase();
   const visibleImports = imports.filter((batch) =>
@@ -4305,10 +4317,14 @@ function ProjectDetail({
       .toLowerCase()
       .includes(normalizedHistoryQuery),
   );
-  const missingByEnvironment = (name: string) =>
-    differences.filter((item) =>
-      (item.missingEnvironments ?? "").split("|||").includes(name),
-    ).length;
+  const missingByEnvironment = (environmentId: string) => {
+    const coverage = insight.coverage.find(
+      (item) => item.environmentId === environmentId,
+    );
+    return coverage
+      ? Math.max(0, number(coverage.expectedCount) - number(coverage.presentCount))
+      : 0;
+  };
   return (
     <>
       <SheetHeader>
@@ -4599,7 +4615,7 @@ function ProjectDetail({
               </div>
               <div className="space-y-2">
                 {envs.map((env) => {
-                  const missing = missingByEnvironment(env.name);
+                  const missing = missingByEnvironment(env.id);
                   return (
                     <div
                       key={env.id}
@@ -4743,7 +4759,7 @@ function AnchorSyncPanel({
             <div className="grid grid-cols-3 gap-2">{[[summary?.add ?? 0, labels.generated, "text-emerald-600"], [summary?.modify ?? 0, labels.modified, "text-blue-600"], [summary?.extra ?? 0, labels.extra, "text-red-600"]].map(([value, label, tone]) => <div key={String(label)} className="rounded-lg border px-3 py-2"><strong className={`block text-base tabular-nums ${tone}`}>{value}</strong><span className="text-[10px] text-muted-foreground">{label}</span></div>)}</div>
             {diffItems.length ? <div className="max-h-52 space-y-1 overflow-y-auto rounded-lg border p-2">{diffItems.map((item) => <div key={`${item.label}-${item.tableName}-${item.columnName ?? ""}`} className="rounded-md px-2 py-1.5 text-[11px] hover:bg-muted/40"><div className="flex items-center gap-2"><span className={`grid size-5 shrink-0 place-items-center rounded text-[10px] font-semibold ${item.result === "added" ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-300" : item.result === "modified" ? "bg-blue-50 text-blue-700 dark:bg-blue-950/30 dark:text-blue-300" : "bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-300"}`}>{item.result === "added" ? "+" : item.result === "modified" ? "~" : "−"}</span><span className="min-w-0 flex-1 truncate">{item.label}</span><span className="text-[10px] text-muted-foreground">{item.result === "added" ? labels.generated : item.result === "modified" ? labels.modified : labels.extra}</span></div>{item.changes?.length ? <div className="ml-7 mt-1 truncate text-[10px] text-muted-foreground">{item.changes.join(" · ")}</div> : null}{item.before || item.after ? <div className="ml-7 mt-1 space-y-0.5 font-mono text-[9px] leading-4">{item.before ? <div className={item.result === "removed" || item.result === "modified" ? "text-red-600 dark:text-red-400" : "text-muted-foreground"}>− {item.before}</div> : null}{item.after ? <div className={item.result === "added" || item.result === "modified" ? "text-blue-600 dark:text-blue-400" : "text-muted-foreground"}>+ {item.after}</div> : null}</div> : null}</div>)}</div> : <p className="rounded-lg bg-muted/50 px-3 py-3 text-center text-[11px] text-muted-foreground">{labels.none}</p>}
             {insight.sql ? <div className="space-y-2"><div className="flex flex-wrap items-center gap-2"><Button type="button" variant="outline" size="sm" onClick={() => setShowSql((value) => !value)}>{showSql ? labels.sql : `${labels.sql} · ${insight.sql.split(";").filter(Boolean).length}`}</Button><Button type="button" variant="ghost" size="sm" onClick={() => { void navigator.clipboard?.writeText(insight.sql); toast(locale === "zh" ? "SQL 已复制" : "SQL copied"); }}><Copy className="size-3.5" /></Button><Button type="button" size="sm" disabled={registering} onClick={() => void register()}><Check className="size-3.5" />{registering ? "…" : labels.register}</Button></div>{showSql && <Textarea value={insight.sql} readOnly className="min-h-32 resize-y font-mono text-[10px] leading-5" />}</div> : null}
-            {insight.executions.length ? <div className="border-t pt-3"><div className="mb-2 flex items-center gap-2 text-[10px] font-medium text-muted-foreground"><History className="size-3.5" />{labels.history}</div><div className="space-y-1">{insight.executions.slice(0, 5).map((execution) => <div key={execution.id} className="flex items-center gap-2 text-[10px]"><span className={`size-1.5 rounded-full ${execution.status === "executed" || execution.status === "verified" ? "bg-emerald-500" : execution.status === "failed" ? "bg-red-500" : "bg-amber-500"}`} /><span className="min-w-0 flex-1 truncate">{execution.environmentName} · {execution.versionName}</span><span className="text-muted-foreground">{locale === "zh" ? ({ executed: "已执行", verified: "已核验", registered: "待执行", pending: "待执行", failed: "失败" } as Record<string, string>)[execution.status] ?? execution.status : execution.status}</span></div>)}</div></div> : null}
+            {insight.executions.length ? <div className="border-t pt-3"><div className="mb-2 flex items-center gap-2 text-[10px] font-medium text-muted-foreground"><History className="size-3.5" />{labels.history}</div><div className="space-y-1">{insight.executions.slice(0, 5).map((execution) => <div key={execution.id} className="flex items-center gap-2 text-[10px]"><span className={`size-1.5 rounded-full ${execution.status === "executed" || execution.status === "verified" ? "bg-emerald-500" : execution.status === "failed" ? "bg-red-500" : execution.status === "waived" ? "bg-muted-foreground/40" : "bg-amber-500"}`} /><span className="min-w-0 flex-1 truncate">{execution.environmentName} · {execution.versionName}</span><span className="text-muted-foreground">{locale === "zh" ? ({ executed: "已执行", verified: "已核验", registered: "待执行", pending: "待执行", failed: "失败", waived: "已撤销" } as Record<string, string>)[execution.status] ?? execution.status : execution.status}</span></div>)}</div></div> : null}
           </> : null}
         </>}
       </CardContent>
@@ -4988,6 +5004,9 @@ function ImportDetail({
   const [name, setName] = useState("");
   const [resolving, setResolving] = useState("");
   const [itemFilter, setItemFilter] = useState<"conflict" | "review" | "all">("conflict");
+  const [itemQuery, setItemQuery] = useState("");
+  const [itemLimit, setItemLimit] = useState(80);
+  const [showFullSql, setShowFullSql] = useState(false);
   const loadDetail = useCallback(
     () =>
       fetch(`/api/catalog?mode=import&importId=${encodeURIComponent(importId)}`)
@@ -4999,6 +5018,9 @@ function ImportDetail({
           setInsight(result);
           setName(result.batch.name);
           setItemFilter(result.batch.conflictCount > 0 ? "conflict" : "all");
+          setItemQuery("");
+          setItemLimit(80);
+          setShowFullSql(false);
         }),
     [importId],
   );
@@ -5012,9 +5034,22 @@ function ImportDetail({
       />
     );
   const { batch, items } = insight;
+  const rawSql = batch.rawSql ?? "";
+  const sqlPreview = showFullSql ? rawSql : rawSql.slice(0, 12000);
   const conflictItems = items.filter((item) => item.result === "conflict");
   const reviewItems = items.filter((item) => item.reviewStatus === "pending");
-  const visibleItems = (itemFilter === "conflict" ? conflictItems : itemFilter === "review" ? reviewItems : items);
+  const filteredItems = (
+    itemFilter === "conflict"
+      ? conflictItems
+      : itemFilter === "review"
+        ? reviewItems
+        : items
+  ).filter((item) =>
+    `${item.tableName}.${item.columnName} ${item.message} ${item.action}`
+      .toLowerCase()
+      .includes(itemQuery.trim().toLowerCase()),
+  );
+  const visibleItems = filteredItems.slice(0, itemLimit);
   const rename = async () => {
     if (!name.trim()) return;
     try {
@@ -5263,8 +5298,29 @@ function ImportDetail({
             <strong className="text-xs">SQL</strong>
           </div>
           <pre className="max-h-72 overflow-auto rounded-xl bg-muted/50 p-4 text-[10px] leading-5">
-            {batch.rawSql || "—"}
+            {sqlPreview || "—"}
+            {!showFullSql && rawSql.length > sqlPreview.length ? "\n…" : ""}
           </pre>
+          {rawSql.length > 12000 && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="mt-2"
+              onClick={() => setShowFullSql((current) => !current)}
+            >
+              {showFullSql
+                ? locale === "zh"
+                  ? "收起完整 SQL"
+                  : "Collapse SQL"
+                : locale === "zh"
+                  ? "查看完整 SQL"
+                  : "Show full SQL"}
+              <ChevronDown
+                className={showFullSql ? "rotate-180 transition-transform" : "transition-transform"}
+              />
+            </Button>
+          )}
         </section>
         <section>
           <div className="mb-2 flex items-center gap-2">
@@ -5285,15 +5341,36 @@ function ImportDetail({
               <button
                 type="button"
                 key={value}
-                onClick={() => setItemFilter(value)}
+                onClick={() => {
+                  setItemFilter(value);
+                  setItemLimit(80);
+                }}
                 className={`rounded-md px-2.5 py-1 text-[10px] transition-colors ${itemFilter === value ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
               >
                 {label} {count}
               </button>
             ))}
             <span className="ml-auto pr-2 text-[10px] text-muted-foreground">
-              {locale === "zh" ? "优先处理冲突" : "Resolve conflicts first"}
+              {locale === "zh"
+                ? `显示 ${visibleItems.length}/${filteredItems.length}`
+                : `${visibleItems.length}/${filteredItems.length} shown`}
             </span>
+          </div>
+          <div className="relative mb-3">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={itemQuery}
+              onChange={(event) => {
+                setItemQuery(event.target.value);
+                setItemLimit(80);
+              }}
+              className="h-9 pl-9 text-xs"
+              placeholder={
+                locale === "zh"
+                  ? "搜索表、字段或处理说明"
+                  : "Search table, field, or message"
+              }
+            />
           </div>
           <div className="divide-y rounded-xl border">
             {visibleItems.map((item) => (
@@ -5377,6 +5454,21 @@ function ImportDetail({
                 )}
               </div>
             ))}
+            {filteredItems.length > visibleItems.length && (
+              <div className="flex justify-center p-3">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setItemLimit((current) => current + 80)}
+                >
+                  {locale === "zh"
+                    ? `继续显示 · 还有 ${filteredItems.length - visibleItems.length}`
+                    : `Show more · ${filteredItems.length - visibleItems.length} left`}
+                  <ChevronDown />
+                </Button>
+              </div>
+            )}
             {!visibleItems.length && (
               <div className="p-6 text-center text-xs text-muted-foreground">
                 {itemFilter === "conflict"
@@ -5861,6 +5953,7 @@ function SchemaDiffViewer({
   locale,
   emptyText,
   indexItems,
+  constraintItems,
 }: {
   preview: {
     items: ImportPreviewItem[];
@@ -5870,6 +5963,7 @@ function SchemaDiffViewer({
   locale: "zh" | "en";
   emptyText?: string;
   indexItems?: ScopePreview["indexItems"];
+  constraintItems?: ScopePreview["constraintItems"];
 }) {
   const [filter, setFilter] = useState<"all" | ImportPreviewItem["result"]>(
     "all",
@@ -5878,8 +5972,11 @@ function SchemaDiffViewer({
   const [limit, setLimit] = useState(80);
   const resolvedIndexItems =
     indexItems ?? (preview as ScopePreview | null)?.indexItems;
+  const resolvedConstraintItems =
+    constraintItems ?? (preview as ScopePreview | null)?.constraintItems;
   const changed =
     preview?.items.filter((item) => item.result !== "unchanged") ?? [];
+  const normalizedQuery = query.trim().toLowerCase();
   const filtered = (
     filter === "all"
       ? changed
@@ -5887,11 +5984,39 @@ function SchemaDiffViewer({
   ).filter((item) =>
     `${item.tableName}.${item.columnName} ${item.fieldCode ?? ""} ${item.changes.join(" ")}`
       .toLowerCase()
-      .includes(query.trim().toLowerCase()),
+      .includes(normalizedQuery),
   );
   const visible = filtered.slice(0, limit);
+  const filteredIndexItems = (resolvedIndexItems ?? []).filter(
+    (item) =>
+      item.result !== "unchanged" &&
+      (filter === "all" || item.result === filter) &&
+      `${item.name} ${item.kind} ${item.columnsJson}`
+        .toLowerCase()
+        .includes(normalizedQuery),
+  );
+  const filteredConstraintItems = (resolvedConstraintItems ?? []).filter(
+    (item) =>
+      item.result !== "unchanged" &&
+      (filter === "all" || item.result === filter) &&
+      `${item.name} ${item.kind} ${item.definition}`
+        .toLowerCase()
+        .includes(normalizedQuery),
+  );
+  const structuralCount = (result: ImportPreviewItem["result"]) =>
+    (resolvedIndexItems ?? []).filter((item) => item.result === result).length +
+    (resolvedConstraintItems ?? []).filter((item) => item.result === result)
+      .length;
   const count = (result: ImportPreviewItem["result"]) =>
-    number(preview?.summary[result]);
+    number(preview?.summary[result]) + structuralCount(result);
+  const changedCount =
+    changed.length +
+    (resolvedIndexItems ?? []).filter((item) => item.result !== "unchanged").length +
+    (resolvedConstraintItems ?? []).filter(
+      (item) => item.result !== "unchanged",
+    ).length;
+  const hasVisibleStructural =
+    filteredIndexItems.length > 0 || filteredConstraintItems.length > 0;
   const tone = (result: ImportPreviewItem["result"]) =>
     result === "added"
       ? "text-diff-added"
@@ -5952,7 +6077,7 @@ function SchemaDiffViewer({
     {
       value: "all",
       label: locale === "zh" ? "全部变化" : "All changes",
-      count: changed.length,
+      count: changedCount,
       mark: "≡",
       tone: "text-foreground",
     },
@@ -6027,19 +6152,17 @@ function SchemaDiffViewer({
         </div>
         <span className="hidden shrink-0 text-[10px] text-muted-foreground xl:block">
           {locale === "zh"
-            ? `一致 ${count("unchanged")} · 共 ${preview?.items.length ?? 0}`
-            : `${count("unchanged")} unchanged · ${preview?.items.length ?? 0} total`}
+            ? `一致 ${count("unchanged")} · 共 ${(preview?.items.length ?? 0) + (resolvedIndexItems?.length ?? 0) + (resolvedConstraintItems?.length ?? 0)}`
+            : `${count("unchanged")} unchanged · ${(preview?.items.length ?? 0) + (resolvedIndexItems?.length ?? 0) + (resolvedConstraintItems?.length ?? 0)} total`}
         </span>
       </div>
-      {resolvedIndexItems?.some((item) => item.result !== "unchanged") && (
+      {filteredIndexItems.length > 0 && (
         <div className="shrink-0 border-b px-5 py-3">
           <div className="mb-2 text-[11px] font-semibold">
             {locale === "zh" ? "索引差异" : "Index differences"}
           </div>
           <div className="flex flex-wrap gap-2">
-            {resolvedIndexItems
-              .filter((item) => item.result !== "unchanged")
-              .map((item) => {
+            {filteredIndexItems.map((item) => {
                 const columns = JSON.parse(item.columnsJson) as string[];
                 const tone =
                   item.result === "added"
@@ -6066,6 +6189,41 @@ function SchemaDiffViewer({
                   </div>
                 );
               })}
+          </div>
+        </div>
+      )}
+      {filteredConstraintItems.length > 0 && (
+        <div className="shrink-0 border-b px-5 py-3">
+          <div className="mb-2 text-[11px] font-semibold">
+            {locale === "zh" ? "约束差异" : "Constraint differences"}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {filteredConstraintItems.map((item) => {
+              const itemTone =
+                item.result === "added"
+                  ? "text-diff-added"
+                  : item.result === "removed"
+                    ? "text-diff-removed"
+                    : "text-diff-modified";
+              return (
+                <div
+                  key={item.name}
+                  className="rounded-lg border bg-background px-3 py-2 text-[10px]"
+                >
+                  <span className={`mr-2 font-mono font-semibold ${itemTone}`}>
+                    {item.result === "added"
+                      ? "+"
+                      : item.result === "removed"
+                        ? "−"
+                        : "~"}
+                  </span>
+                  <code>{item.name}</code>
+                  <span className="ml-2 text-muted-foreground">
+                    {item.kind} · {item.definition}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -6171,9 +6329,17 @@ function SchemaDiffViewer({
         ) : (
           <div className="grid h-full place-items-center px-6 text-center">
             <div>
-              <CheckCircle2 className="mx-auto size-6 text-diff-added" />
+              {hasVisibleStructural ? (
+                <ArrowLeftRight className="mx-auto size-6 text-diff-modified" />
+              ) : (
+                <CheckCircle2 className="mx-auto size-6 text-diff-added" />
+              )}
               <p className="mt-4 text-sm font-medium">
-                {query
+                {hasVisibleStructural
+                  ? locale === "zh"
+                    ? "字段一致，索引或约束存在差异"
+                    : "Fields match; indexes or constraints differ"
+                  : query
                   ? locale === "zh"
                     ? "没有匹配的差异"
                     : "No matching difference"
@@ -6183,7 +6349,11 @@ function SchemaDiffViewer({
                       : "The two scopes match"))}
               </p>
               <p className="mt-1.5 text-xs text-muted-foreground">
-                {changed.length
+                {hasVisibleStructural
+                  ? locale === "zh"
+                    ? "结构差异已显示在上方"
+                    : "Structural differences are shown above"
+                  : changedCount
                   ? locale === "zh"
                     ? "可以切换其他变化类型"
                     : "Choose another change type"
