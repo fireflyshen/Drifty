@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "drifty",
-      "database_id": "7d9b3616-e8da-4293-92ab-732b93bb48df",
+      "database_id": "a07664f0-0534-47ec-b7e5-3588ad0969d7",
       "migrations_dir": "drizzle"
     }
   ],
