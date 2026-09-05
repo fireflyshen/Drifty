@@ -78,8 +78,95 @@ async function validateScopeSelection(db:D1Database, projectId:string, versionId
   const ids=[...new Set(environmentIds)];
   if (!ids.length) return '请至少选择一个环境。';
   const placeholders=ids.map(()=>'?').join(',');
-  const row=await db.prepare(`SELECT count(DISTINCT id) AS count FROM catalog_environments WHERE id IN (${placeholders}) AND project_id=? AND archived=0 AND (version_id=? OR version_id IS NULL)`).bind(...ids,projectId,versionId).first<{count:number}>();
+  const row=await db.prepare(`SELECT count(DISTINCT id) AS count FROM catalog_environments WHERE id IN (${placeholders}) AND project_id=? AND archived=0`).bind(...ids,projectId).first<{count:number}>();
   return Number(row?.count??0)===ids.length?null:'所选环境与当前项目或版本不匹配。';
+}
+
+type SnapshotObjectRow={entity:string;objectKey:string;objectId:string|null;revisionId:string|null;fingerprint:string;definitionJson:string};
+
+async function captureEnvironmentSnapshot(db:D1Database,input:{projectId:string;versionId:string;environmentId:string;importBatchId:string;sourceKind:string}) {
+  const [tables,fields,indexes,constraints]=await Promise.all([
+    db.prepare(`SELECT t.id,t.name,t.code,t.comment FROM table_scopes s JOIN catalog_tables t ON t.id=s.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' ORDER BY t.name`).bind(input.projectId,input.versionId,input.environmentId).all<{id:string;name:string;code:string;comment:string}>(),
+    db.prepare(`SELECT f.id,f.code,f.name,t.name AS tableName,csr.revision_id AS revisionId,
+      coalesce(fr.data_type,f.data_type) AS dataType,coalesce(fr.nullable,f.nullable) AS nullable,
+      CASE WHEN fr.id IS NULL THEN f.default_value ELSE fr.default_value END AS defaultValue,
+      coalesce(fr.comment,f.comment) AS comment,coalesce(fr.extra,f.extra) AS extra,coalesce(fr.ordinal,f.ordinal) AS ordinal
+      FROM field_scopes s JOIN catalog_fields f ON f.id=s.field_id JOIN catalog_tables t ON t.id=f.table_id
+      LEFT JOIN catalog_field_scope_revisions csr ON csr.field_id=s.field_id AND csr.version_id=s.version_id AND csr.environment_id=s.environment_id
+      LEFT JOIN catalog_field_revisions fr ON fr.id=csr.revision_id
+      WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' ORDER BY t.name,coalesce(fr.ordinal,f.ordinal),f.name`).bind(input.projectId,input.versionId,input.environmentId).all<{id:string;code:string;name:string;tableName:string;revisionId:string|null;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string;ordinal:number}>(),
+    db.prepare(`SELECT i.id,i.name,i.kind,i.columns_json AS columnsJson,t.name AS tableName FROM catalog_index_scopes s JOIN catalog_indexes i ON i.id=s.index_id JOIN catalog_tables t ON t.id=i.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' ORDER BY t.name,i.name`).bind(input.projectId,input.versionId,input.environmentId).all<{id:string;name:string;kind:string;columnsJson:string;tableName:string}>(),
+    db.prepare(`SELECT c.id,c.name,c.kind,c.definition,t.name AS tableName FROM catalog_constraint_scopes s JOIN catalog_constraints c ON c.id=s.constraint_id JOIN catalog_tables t ON t.id=c.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' ORDER BY t.name,c.name`).bind(input.projectId,input.versionId,input.environmentId).all<{id:string;name:string;kind:string;definition:string;tableName:string}>(),
+  ]);
+  const objects:{entity:string;objectKey:string;objectId:string|null;revisionId:string|null;fingerprint:string;definitionJson:string}[]=[];
+  for(const table of tables.results){const definition={name:table.name,code:table.code,comment:table.comment};objects.push({entity:'table',objectKey:table.name.toLowerCase(),objectId:table.id,revisionId:null,fingerprint:await hash(JSON.stringify(definition)),definitionJson:JSON.stringify(definition)});}
+  for(const field of fields.results){const definition={code:field.code,name:field.name,tableName:field.tableName,dataType:field.dataType,nullable:Boolean(field.nullable),defaultValue:field.defaultValue,comment:field.comment,extra:field.extra,ordinal:field.ordinal};objects.push({entity:'field',objectKey:`${field.tableName}.${field.name}`.toLowerCase(),objectId:field.id,revisionId:field.revisionId,fingerprint:fieldFingerprint({tableName:field.tableName,columnName:field.name,dataType:field.dataType,nullable:Boolean(field.nullable),defaultValue:field.defaultValue,comment:field.comment,extra:field.extra}),definitionJson:JSON.stringify(definition)});}
+  for(const index of indexes.results){const definition={name:index.name,tableName:index.tableName,kind:index.kind,columnsJson:index.columnsJson};objects.push({entity:'index',objectKey:`${index.tableName}.${index.name}`.toLowerCase(),objectId:index.id,revisionId:null,fingerprint:`${index.kind}|${index.columnsJson}`,definitionJson:JSON.stringify(definition)});}
+  for(const constraint of constraints.results){const definition={name:constraint.name,tableName:constraint.tableName,kind:constraint.kind,definition:constraint.definition};objects.push({entity:'constraint',objectKey:`${constraint.tableName}.${constraint.name}`.toLowerCase(),objectId:constraint.id,revisionId:null,fingerprint:`${constraint.kind}|${constraint.definition}`,definitionJson:JSON.stringify(definition)});}
+  const snapshotId=id();
+  const stamp=now();
+  const code=`SNP-${stamp.slice(0,10).replaceAll('-','')}-${snapshotId.slice(0,8).toUpperCase()}`;
+  const fingerprint=await hash(objects.map((item)=>`${item.entity}|${item.objectKey}|${item.fingerprint}`).sort().join('\n'));
+  await runChunked(db,[
+    db.prepare(`INSERT INTO catalog_snapshots (id,code,project_id,version_id,environment_id,import_batch_id,fingerprint,source_kind,captured_at) VALUES (?,?,?,?,?,?,?,?,?)`).bind(snapshotId,code,input.projectId,input.versionId,input.environmentId,input.importBatchId,fingerprint,input.sourceKind,stamp),
+    ...objects.map((item)=>db.prepare(`INSERT INTO catalog_snapshot_objects (snapshot_id,entity,object_key,object_id,revision_id,fingerprint,definition_json) VALUES (?,?,?,?,?,?,?)`).bind(snapshotId,item.entity,item.objectKey,item.objectId,item.revisionId,item.fingerprint,item.definitionJson)),
+  ]);
+  return {id:snapshotId,code,fingerprint,objectCount:objects.length};
+}
+
+async function latestSnapshotObjects(db:D1Database,scope:{projectId:string;versionId:string;environmentId:string}) {
+  const snapshot=await db.prepare(`SELECT id,code,captured_at AS capturedAt FROM catalog_snapshots WHERE project_id=? AND version_id=? AND environment_id=? ORDER BY captured_at DESC LIMIT 1`).bind(scope.projectId,scope.versionId,scope.environmentId).first<{id:string;code:string;capturedAt:string}>();
+  if(!snapshot) return null;
+  const rows=(await db.prepare(`SELECT entity,object_key AS objectKey,object_id AS objectId,revision_id AS revisionId,fingerprint,definition_json AS definitionJson FROM catalog_snapshot_objects WHERE snapshot_id=? ORDER BY entity,object_key`).bind(snapshot.id).all<SnapshotObjectRow>()).results;
+  return {snapshot,rows};
+}
+
+async function verifyChangesAgainstSnapshot(db:D1Database,scope:{projectId:string;versionId:string;environmentId:string}) {
+  const snapshot=await latestSnapshotObjects(db,scope);
+  if(!snapshot) return 0;
+  const objects=new Map(snapshot.rows.map((row)=>[`${row.entity}|${row.objectKey}`,row]));
+  const changes=(await db.prepare(`SELECT c.id,c.import_batch_id AS importBatchId,c.action,c.table_name AS tableName,c.field_name AS fieldName,c.sql_text AS sqlText
+    FROM catalog_changes c JOIN catalog_change_scopes cs ON cs.change_id=c.id
+    LEFT JOIN import_batches b ON b.id=c.import_batch_id
+    WHERE c.project_id=? AND c.version_id=? AND cs.environment_id=? AND cs.status IN ('pending','executed')
+      AND (c.import_batch_id IS NULL OR coalesce(b.import_mode,'executed')<>'snapshot')`).bind(scope.projectId,scope.versionId,scope.environmentId).all<{id:string;importBatchId:string|null;action:string;tableName:string;fieldName:string;sqlText:string}>()).results;
+  const parsedCache=new Map<string,ReturnType<typeof parseMysqlSql>>();
+  const statements:D1PreparedStatement[]=[];
+  const batchIds=new Set<string>();
+  for(const change of changes) {
+    const parsed=parsedCache.get(change.sqlText)??parseMysqlSql(change.sqlText);
+    parsedCache.set(change.sqlText,parsed);
+    const action=change.action.toLowerCase();
+    const tableName=change.tableName.toLowerCase();
+    let matches=false;
+    if(action.endsWith('_index')) {
+      const objectName=change.fieldName.replace(/^索引\s*·\s*/,'').toLowerCase();
+      const actual=objects.get(`index|${tableName}.${objectName}`);
+      const expected=parsed.indexes.find((item)=>item.tableName.toLowerCase()===tableName&&item.name.toLowerCase()===objectName);
+      matches=action.startsWith('drop')?!actual:Boolean(actual&&expected&&actual.fingerprint===`${expected.kind}|${JSON.stringify(expected.columns)}`);
+    } else if(action.endsWith('_constraint')) {
+      const objectName=change.fieldName.replace(/^约束\s*·\s*/,'').toLowerCase();
+      const actual=objects.get(`constraint|${tableName}.${objectName}`);
+      const expected=parsed.constraints.find((item)=>item.tableName.toLowerCase()===tableName&&item.name.toLowerCase()===objectName);
+      matches=action.startsWith('drop')?!actual:Boolean(actual&&expected&&actual.fingerprint===`${expected.kind}|${expected.definition}`);
+    } else {
+      const fieldName=change.fieldName.toLowerCase();
+      const actual=objects.get(`field|${tableName}.${fieldName}`);
+      const expected=parsed.fields.find((item)=>item.tableName.toLowerCase()===tableName&&item.columnName.toLowerCase()===fieldName);
+      matches=action==='drop'?!actual:Boolean(actual&&expected&&actual.fingerprint===fieldFingerprint(expected));
+    }
+    if(matches) {
+      const stamp=now();
+      statements.push(db.prepare(`UPDATE catalog_change_scopes SET status='verified',executed_at=coalesce(executed_at,?),verified_at=?,note='已由环境结构快照核验' WHERE change_id=? AND environment_id=?`).bind(stamp,stamp,change.id,scope.environmentId));
+      if(change.importBatchId) batchIds.add(change.importBatchId);
+    }
+  }
+  if(statements.length) await runChunked(db,statements);
+  for(const batchId of batchIds) {
+    const unfinished=await db.prepare(`SELECT count(*) AS count FROM catalog_changes c JOIN catalog_change_scopes cs ON cs.change_id=c.id WHERE c.import_batch_id=? AND cs.environment_id=? AND cs.status NOT IN ('verified','waived')`).bind(batchId,scope.environmentId).first<{count:number}>();
+    if(Number(unfinished?.count??0)===0) await db.prepare(`UPDATE catalog_sql_executions SET status='verified',finished_at=?,note='已由环境结构快照核验' WHERE import_batch_id=? AND environment_id=?`).bind(now(),batchId,scope.environmentId).run();
+  }
+  return statements.length;
 }
 
 export async function GET(request:Request) {
@@ -106,6 +193,17 @@ export async function GET(request:Request) {
     return Response.json({ objects });
   }
 
+  if (mode === 'snapshots') {
+    const projectId=clean(url.searchParams.get('projectId'));
+    const environmentId=clean(url.searchParams.get('environmentId'));
+    const clauses:string[]=[];const bindings:string[]=[];
+    if(projectId){clauses.push('s.project_id=?');bindings.push(projectId);}
+    if(environmentId){clauses.push('s.environment_id=?');bindings.push(environmentId);}
+    const where=clauses.length?`WHERE ${clauses.join(' AND ')}`:'';
+    const rows=await db.prepare(`SELECT s.id,s.code,s.project_id AS projectId,s.version_id AS versionId,s.environment_id AS environmentId,s.import_batch_id AS importBatchId,s.fingerprint,s.source_kind AS sourceKind,s.captured_at AS capturedAt,p.name AS projectName,v.name AS versionName,e.name AS environmentName,count(o.object_key) AS objectCount FROM catalog_snapshots s JOIN catalog_projects p ON p.id=s.project_id JOIN catalog_versions v ON v.id=s.version_id JOIN catalog_environments e ON e.id=s.environment_id LEFT JOIN catalog_snapshot_objects o ON o.snapshot_id=s.id ${where} GROUP BY s.id ORDER BY s.captured_at DESC LIMIT 100`).bind(...bindings).all();
+    return Response.json({snapshots:rows.results});
+  }
+
   if (mode === 'anchor') {
     const projectId=clean(url.searchParams.get('projectId'));
     if (!projectId) return Response.json({ error:'请选择项目。' },{ status:400 });
@@ -114,16 +212,20 @@ export async function GET(request:Request) {
       FROM catalog_projects p LEFT JOIN catalog_versions av ON av.id=p.anchor_version_id
       LEFT JOIN catalog_environments ae ON ae.id=p.anchor_environment_id WHERE p.id=? AND p.archived=0`).bind(projectId).first<{id:string;anchorVersionId:string|null;anchorEnvironmentId:string|null;anchorVersionName:string|null;anchorEnvironmentName:string|null;anchorEnvironmentVersionId:string|null}>();
     if (!project?.anchorVersionId||!project.anchorEnvironmentId) return Response.json({ error:'请先为项目设置锚定版本和锚定环境。' },{ status:400 });
-    if (project.anchorEnvironmentVersionId && project.anchorEnvironmentVersionId!==project.anchorVersionId) return Response.json({ error:'锚定环境与锚定版本不匹配，请重新设置。' },{ status:400 });
     const targetVersionId=clean(url.searchParams.get('versionId'))||project.anchorVersionId;
     const targetEnvironmentId=clean(url.searchParams.get('environmentId'))||project.anchorEnvironmentId;
     const target=await db.prepare(`SELECT v.id AS versionId,v.name AS versionName,e.id AS environmentId,e.name AS environmentName
-      FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id AND e.id=? AND (e.version_id=v.id OR e.version_id IS NULL)
+      FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id AND e.id=?
       WHERE v.id=? AND v.project_id=?`).bind(targetEnvironmentId,targetVersionId,projectId).first<{versionId:string;versionName:string;environmentId:string;environmentName:string}>();
     if (!target) return Response.json({ error:'目标版本或环境不属于当前项目。' },{ status:400 });
     type ScopeTarget={versionId:string;environmentId:string};
     const anchor:ScopeTarget={versionId:project.anchorVersionId,environmentId:project.anchorEnvironmentId};
-    const readFields=async(scope:ScopeTarget)=>(await db.prepare(`SELECT f.id,f.name,t.name AS tableName,
+    const [anchorSnapshot,targetSnapshot]=await Promise.all([
+      latestSnapshotObjects(db,{projectId,...anchor}),latestSnapshotObjects(db,{projectId,versionId:target.versionId,environmentId:target.environmentId}),
+    ]);
+    type AnchorField={id:string;name:string;tableName:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string};
+    const snapshotFields=(snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?.rows.filter((row)=>row.entity==='field').map((row)=>{try{const value=JSON.parse(row.definitionJson) as {name:string;tableName:string;dataType:string;nullable:boolean;defaultValue:string|null;comment:string;extra:string};return {id:row.objectId??row.objectKey,...value,nullable:value.nullable?1:0};}catch{return null;}}).filter((item):item is AnchorField=>Boolean(item))??null;
+    const readFields=async(scope:ScopeTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshotFields(snapshot)??(await db.prepare(`SELECT f.id,f.name,t.name AS tableName,
       CASE WHEN fr.id IS NOT NULL THEN fr.data_type ELSE f.data_type END AS dataType,
       CASE WHEN fr.id IS NOT NULL THEN fr.nullable ELSE f.nullable END AS nullable,
       CASE WHEN fr.id IS NOT NULL THEN fr.default_value ELSE f.default_value END AS defaultValue,
@@ -134,12 +236,14 @@ export async function GET(request:Request) {
       LEFT JOIN catalog_field_revisions fr ON fr.id=csr.revision_id
       WHERE fs.project_id=? AND fs.version_id=? AND fs.environment_id=? AND fs.state='present'
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'
-        AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='field' AND l.object_id=f.id AND l.project_id=? LIMIT 1),f.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId,projectId).all<{id:string;name:string;tableName:string;dataType:string;nullable:number;defaultValue:string|null;comment:string;extra:string}>()).results.map(item=>({...item,dataType:item.dataType,nullable:item.nullable,defaultValue:item.defaultValue,comment:item.comment,extra:item.extra}));
-    const readIndexes=async(scope:ScopeTarget)=>(await db.prepare(`SELECT i.id,i.name,i.kind,i.columns_json AS columnsJson,t.name AS tableName FROM catalog_index_scopes s JOIN catalog_indexes i ON i.id=s.index_id JOIN catalog_tables t ON t.id=i.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='index' AND l.object_id=i.id AND l.project_id=? LIMIT 1),i.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId,projectId).all<{id:string;name:string;kind:string;columnsJson:string;tableName:string}>()).results;
-    const readConstraints=async(scope:ScopeTarget)=>(await db.prepare(`SELECT c.id,c.name,c.kind,c.definition,t.name AS tableName FROM catalog_constraint_scopes s JOIN catalog_constraints c ON c.id=s.constraint_id JOIN catalog_tables t ON t.id=c.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='constraint' AND l.object_id=c.id AND l.project_id=? LIMIT 1),c.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId,projectId).all<{id:string;name:string;kind:string;definition:string;tableName:string}>()).results;
-    const readTables=async(scope:ScopeTarget)=>(await db.prepare(`SELECT DISTINCT t.name FROM table_scopes s JOIN catalog_tables t ON t.id=s.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId).all<{name:string}>()).results.map(item=>item.name.toLowerCase());
+        AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='field' AND l.object_id=f.id AND l.project_id=? LIMIT 1),f.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId,projectId).all<AnchorField>()).results;
+    const snapshotIndexes=(snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?.rows.filter((row)=>row.entity==='index').map((row)=>{try{return {id:row.objectId??row.objectKey,...JSON.parse(row.definitionJson) as {name:string;kind:string;columnsJson:string;tableName:string}};}catch{return null;}}).filter((item):item is {id:string;name:string;kind:string;columnsJson:string;tableName:string}=>Boolean(item))??null;
+    const readIndexes=async(scope:ScopeTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshotIndexes(snapshot)??(await db.prepare(`SELECT i.id,i.name,i.kind,i.columns_json AS columnsJson,t.name AS tableName FROM catalog_index_scopes s JOIN catalog_indexes i ON i.id=s.index_id JOIN catalog_tables t ON t.id=i.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='index' AND l.object_id=i.id AND l.project_id=? LIMIT 1),i.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId,projectId).all<{id:string;name:string;kind:string;columnsJson:string;tableName:string}>()).results;
+    const snapshotConstraints=(snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?.rows.filter((row)=>row.entity==='constraint').map((row)=>{try{return {id:row.objectId??row.objectKey,...JSON.parse(row.definitionJson) as {name:string;kind:string;definition:string;tableName:string}};}catch{return null;}}).filter((item):item is {id:string;name:string;kind:string;definition:string;tableName:string}=>Boolean(item))??null;
+    const readConstraints=async(scope:ScopeTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshotConstraints(snapshot)??(await db.prepare(`SELECT c.id,c.name,c.kind,c.definition,t.name AS tableName FROM catalog_constraint_scopes s JOIN catalog_constraints c ON c.id=s.constraint_id JOIN catalog_tables t ON t.id=c.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='constraint' AND l.object_id=c.id AND l.project_id=? LIMIT 1),c.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId,projectId).all<{id:string;name:string;kind:string;definition:string;tableName:string}>()).results;
+    const readTables=async(scope:ScopeTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?snapshot.rows.filter((row)=>row.entity==='table').map((row)=>row.objectKey):(await db.prepare(`SELECT DISTINCT t.name FROM table_scopes s JOIN catalog_tables t ON t.id=s.table_id WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'`).bind(projectId,scope.versionId,scope.environmentId,projectId).all<{name:string}>()).results.map(item=>item.name.toLowerCase());
     const [anchorFields,targetFields,anchorIndexes,targetIndexes,anchorConstraints,targetConstraints,anchorTables,targetTables,executions]=await Promise.all([
-      readFields(anchor),readFields(target),readIndexes(anchor),readIndexes(target),readConstraints(anchor),readConstraints(target),readTables(anchor),readTables(target),
+      readFields(anchor,anchorSnapshot),readFields(target,targetSnapshot),readIndexes(anchor,anchorSnapshot),readIndexes(target,targetSnapshot),readConstraints(anchor,anchorSnapshot),readConstraints(target,targetSnapshot),readTables(anchor,anchorSnapshot),readTables(target,targetSnapshot),
       db.prepare(`SELECT x.id,x.status,x.environment_id AS environmentId,e.name AS environmentName,v.name AS versionName,x.created_at AS createdAt,x.sql_text AS sqlText FROM catalog_sql_executions x JOIN catalog_environments e ON e.id=x.environment_id JOIN catalog_versions v ON v.id=x.version_id WHERE x.project_id=? ORDER BY x.created_at DESC LIMIT 200`).bind(projectId).all<{id:string;status:string;environmentId:string;environmentName:string;versionName:string;createdAt:string;sqlText:string}>(),
     ]);
     const fieldKey=(item:{tableName:string;name:string})=>`${item.tableName.toLowerCase()}.${item.name.toLowerCase()}`;
@@ -158,7 +262,7 @@ export async function GET(request:Request) {
     for(const item of fieldItems.filter(item=>item.result==='added'||item.result==='modified')) if(!tableItems.some(table=>table.tableName===item.tableName&&table.result==='added')) sql.push(`ALTER TABLE ${sqlIdentifier(item.tableName)} ${item.result==='added'?'ADD COLUMN':'MODIFY COLUMN'} ${sqlIdentifier(item.columnName??'')} ${item.result==='added'?item.before??'':item.before??''};`);
     for(const item of indexItems.filter(item=>item.result==='added'||item.result==='modified')) if(!tableItems.some(table=>table.tableName===item.tableName&&table.result==='added')) {const anchorIndex=anchorIndexMap.get(`${item.tableName.toLowerCase()}.${item.columnName?.toLowerCase()}`);if(anchorIndex){if(item.result==='modified')sql.push(`ALTER TABLE ${sqlIdentifier(item.tableName)} ${anchorIndex.kind==='primary'?'DROP PRIMARY KEY':`DROP INDEX ${sqlIdentifier(anchorIndex.name)}`};`);sql.push(`ALTER TABLE ${sqlIdentifier(item.tableName)} ${indexDefinition(anchorIndex)};`);}}
     for(const item of constraintItems.filter(item=>item.result==='added'||item.result==='modified')) if(!tableItems.some(table=>table.tableName===item.tableName&&table.result==='added')) {const constraint=anchorConstraintMap.get(`${item.tableName.toLowerCase()}.${item.columnName?.toLowerCase()}`);if(constraint){if(item.result==='modified') sql.push(`ALTER TABLE ${sqlIdentifier(item.tableName)} ${constraint.kind==='foreign'?'DROP FOREIGN KEY':'DROP CHECK'} ${sqlIdentifier(constraint.name)};`);sql.push(`ALTER TABLE ${sqlIdentifier(item.tableName)} ADD ${constraint.definition.toUpperCase().startsWith('CONSTRAINT')?constraint.definition:`CONSTRAINT ${sqlIdentifier(constraint.name)} ${constraint.definition}`};`);}}
-    return Response.json({ok:true,anchor:{versionId:anchor.versionId,environmentId:anchor.environmentId,versionName:project.anchorVersionName,environmentName:project.anchorEnvironmentName},target:{...target},tableItems,fieldItems,indexItems,constraintItems,sql:sql.join('\n'),executions:executions.results});
+    return Response.json({ok:true,anchor:{versionId:anchor.versionId,environmentId:anchor.environmentId,versionName:project.anchorVersionName,environmentName:project.anchorEnvironmentName,snapshotCode:anchorSnapshot?.snapshot.code??null},target:{...target,snapshotCode:targetSnapshot?.snapshot.code??null},tableItems,fieldItems,indexItems,constraintItems,sql:sql.join('\n'),executions:executions.results});
   }
 
   if (mode === 'search') {
@@ -283,7 +387,7 @@ export async function GET(request:Request) {
   if (mode === 'import') {
     const importId=clean(url.searchParams.get('importId'));
     const [batch,items]=await Promise.all([
-      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
+      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,b.import_mode AS importMode,
         b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
         b.raw_sql AS rawSql,b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,
         m.name AS moduleName,r.repository,r.branch AS repositoryBranch,v.git_ref AS gitRef,
@@ -354,17 +458,16 @@ export async function GET(request:Request) {
 
   if (mode === 'release') {
     const projectId=clean(url.searchParams.get('projectId'));
+    const batchId=clean(url.searchParams.get('batchId'));
+    const limit=Math.min(5000,Math.max(1,Number(url.searchParams.get('limit'))||200));
+    const offset=Math.max(0,Number(url.searchParams.get('offset'))||0);
     const requestedLifecycle=clean(url.searchParams.get('lifecycleStatus'));
     // Release is about executable rollout changes, not the initial snapshot
     // used to seed an environment.  The legacy batches are recognised as
     // pure CREATE/add-only snapshots; new baseline imports already create no
     // catalog_changes at all.
     const lifecycleFilter=['active','deprecated','removed'].includes(requestedLifecycle)?requestedLifecycle:'active';
-    const rows=await db.prepare(`WITH baseline_batches AS (
-      SELECT b.id FROM import_batches b
-      WHERE lower(coalesce(b.raw_sql,'')) LIKE '%create table%'
-        AND NOT EXISTS (SELECT 1 FROM import_items bi WHERE bi.batch_id=b.id AND (lower(bi.action)<>'add' OR bi.result='conflict'))
-    ), effective AS (
+    const rows=await db.prepare(`WITH effective AS (
       SELECT c.*,
         coalesce(
           (SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='field' AND l.object_id=c.field_id AND l.project_id=c.project_id LIMIT 1),
@@ -372,16 +475,16 @@ export async function GET(request:Request) {
           f.lifecycle_status,t.lifecycle_status,'active'
         ) AS lifecycleStatus
       FROM catalog_changes c
+      LEFT JOIN import_batches b ON b.id=c.import_batch_id
       LEFT JOIN catalog_fields f ON f.id=c.field_id
       LEFT JOIN catalog_tables t ON lower(t.name)=lower(c.table_name)
-      WHERE c.import_batch_id IS NULL OR c.import_batch_id NOT IN (SELECT id FROM baseline_batches)
+      WHERE c.import_batch_id IS NULL OR coalesce(b.import_mode,'executed')<>'snapshot'
     ), scoped AS (
-      SELECT cs.change_id,cs.environment_id,
-        CASE WHEN cs.status='pending' AND c.field_id IS NOT NULL AND EXISTS (
-          SELECT 1 FROM field_scopes fs WHERE fs.field_id=c.field_id AND fs.project_id=c.project_id AND fs.version_id=c.version_id AND fs.environment_id=cs.environment_id AND fs.state='present'
-        ) THEN 'verified' ELSE cs.status END AS status
+      SELECT cs.change_id,cs.environment_id,cs.status
       FROM catalog_change_scopes cs JOIN effective c ON c.id=cs.change_id
     ) SELECT c.id,c.code,c.name,c.action,c.table_name AS tableName,c.field_name AS fieldName,c.field_id AS fieldId,
+      c.import_batch_id AS importBatchId,coalesce(b.name,c.name) AS batchName,
+      CASE WHEN c.import_batch_id IS NULL THEN 1 ELSE (SELECT count(*) FROM catalog_changes bc WHERE bc.import_batch_id=c.import_batch_id) END AS batchTotal,
       c.project_id AS projectId,c.version_id AS versionId,c.source_kind AS sourceKind,c.source_path AS sourcePath,c.git_commit AS gitCommit,
       c.sql_text AS sqlText,c.status,c.lifecycleStatus,c.created_at AS createdAt,p.name AS projectName,v.name AS versionName,
       count(cs.environment_id) AS environmentCount,
@@ -391,25 +494,19 @@ export async function GET(request:Request) {
       sum(CASE WHEN cs.status='failed' THEN 1 ELSE 0 END) AS failedCount,
       group_concat(CASE WHEN cs.status='pending' THEN e.name END,'|||') AS pendingEnvironments,
       group_concat(e.name,'|||') AS environmentNames,group_concat(e.id,'|||') AS environmentIds,group_concat(cs.status,'|||') AS environmentStatuses
-      FROM effective c JOIN catalog_projects p ON p.id=c.project_id JOIN catalog_versions v ON v.id=c.version_id
+      FROM effective c LEFT JOIN import_batches b ON b.id=c.import_batch_id JOIN catalog_projects p ON p.id=c.project_id JOIN catalog_versions v ON v.id=c.version_id
       LEFT JOIN scoped cs ON cs.change_id=c.id LEFT JOIN catalog_environments e ON e.id=cs.environment_id
-      WHERE (?='' OR c.project_id=?) AND (?='' OR c.lifecycleStatus=?) GROUP BY c.id ORDER BY CASE WHEN sum(CASE WHEN cs.status='pending' THEN 1 ELSE 0 END)>0 THEN 0 ELSE 1 END,c.created_at DESC LIMIT 200`).bind(projectId,projectId,lifecycleFilter,lifecycleFilter).all();
-    const summary=await db.prepare(`WITH baseline_batches AS (
-      SELECT b.id FROM import_batches b
-      WHERE lower(coalesce(b.raw_sql,'')) LIKE '%create table%'
-        AND NOT EXISTS (SELECT 1 FROM import_items bi WHERE bi.batch_id=b.id AND (lower(bi.action)<>'add' OR bi.result='conflict'))
-    ), effective AS (
+      WHERE (?='' OR c.project_id=?) AND (?='' OR c.lifecycleStatus=?) AND (?='' OR c.import_batch_id=?)
+      GROUP BY c.id ORDER BY CASE WHEN sum(CASE WHEN cs.status='pending' THEN 1 ELSE 0 END)>0 THEN 0 ELSE 1 END,c.created_at DESC LIMIT ? OFFSET ?`).bind(projectId,projectId,lifecycleFilter,lifecycleFilter,batchId,batchId,limit,offset).all();
+    const summary=await db.prepare(`WITH effective AS (
       SELECT c.*,coalesce(
         (SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='field' AND l.object_id=c.field_id AND l.project_id=c.project_id LIMIT 1),
         (SELECT l.status FROM catalog_object_lifecycles l JOIN catalog_tables lt ON lt.id=l.object_id WHERE l.entity='table' AND lower(lt.name)=lower(c.table_name) AND l.project_id=c.project_id LIMIT 1),
         f.lifecycle_status,t.lifecycle_status,'active') AS lifecycleStatus
-      FROM catalog_changes c LEFT JOIN catalog_fields f ON f.id=c.field_id LEFT JOIN catalog_tables t ON lower(t.name)=lower(c.table_name)
-      WHERE c.import_batch_id IS NULL OR c.import_batch_id NOT IN (SELECT id FROM baseline_batches)
+      FROM catalog_changes c LEFT JOIN import_batches b ON b.id=c.import_batch_id LEFT JOIN catalog_fields f ON f.id=c.field_id LEFT JOIN catalog_tables t ON lower(t.name)=lower(c.table_name)
+      WHERE c.import_batch_id IS NULL OR coalesce(b.import_mode,'executed')<>'snapshot'
     ), scoped AS (
-      SELECT cs.change_id,cs.environment_id,
-        CASE WHEN cs.status='pending' AND c.field_id IS NOT NULL AND EXISTS (
-          SELECT 1 FROM field_scopes fs WHERE fs.field_id=c.field_id AND fs.project_id=c.project_id AND fs.version_id=c.version_id AND fs.environment_id=cs.environment_id AND fs.state='present'
-        ) THEN 'verified' ELSE cs.status END AS status
+      SELECT cs.change_id,cs.environment_id,cs.status
       FROM catalog_change_scopes cs JOIN effective c ON c.id=cs.change_id
     ) SELECT count(DISTINCT c.id) AS changes,
       sum(CASE WHEN cs.status='pending' THEN 1 ELSE 0 END) AS pending,
@@ -436,7 +533,7 @@ export async function GET(request:Request) {
           GROUP BY fs.field_id,fs.version_id
         ), version_envs AS (
           SELECT v.id AS version_id,v.name AS version_name,e.id AS environment_id,e.name AS environment_name
-          FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id AND (e.version_id=v.id OR e.version_id IS NULL)
+          FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id
           WHERE v.project_id=? AND e.archived=0
         ), matrix AS (
           SELECT ex.field_id,ex.expected_revision,ve.version_id,ve.version_name,ve.environment_id,ve.environment_name,fr.revision AS actual_revision
@@ -451,7 +548,7 @@ export async function GET(request:Request) {
         FROM matrix m JOIN catalog_fields f ON f.id=m.field_id JOIN catalog_tables t ON t.id=f.table_id
         GROUP BY f.id,m.version_id HAVING sum(CASE WHEN m.actual_revision=m.expected_revision THEN 1 ELSE 0 END)<count(*)
         ORDER BY (count(*)-sum(CASE WHEN m.actual_revision=m.expected_revision THEN 1 ELSE 0 END)) DESC,t.name,f.ordinal LIMIT 100`).bind(project.id,parentId,project.id,project.id,project.id,project.id).all(),
-      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,b.status,b.added_count AS addedCount,
+      db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,b.import_mode AS importMode,b.status,b.added_count AS addedCount,
         b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
         b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,v.name AS versionName,m.name AS moduleName,
         group_concat(e.name,' · ') AS environmentNames
@@ -470,7 +567,7 @@ export async function GET(request:Request) {
           GROUP BY fs.field_id,fs.version_id
         ), version_envs AS (
           SELECT v.id AS version_id,e.id AS environment_id,e.name AS environment_name
-          FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id AND (e.version_id=v.id OR e.version_id IS NULL)
+          FROM catalog_versions v JOIN catalog_environments e ON e.project_id=v.project_id
           WHERE v.project_id=? AND e.archived=0
         ), matrix AS (
           SELECT ve.environment_id,ve.environment_name,ex.field_id,ex.expected_revision,fr.revision AS actual_revision
@@ -512,7 +609,7 @@ export async function GET(request:Request) {
       GROUP BY t.id ORDER BY t.name`),
     db.prepare(`SELECT count(*) AS count FROM catalog_tables`),
     db.prepare(`SELECT count(*) AS count FROM catalog_fields`),
-    db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,
+    db.prepare(`SELECT b.id,b.code,b.name,b.source_kind AS sourceKind,b.file_name AS fileName,b.source_path AS sourcePath,b.git_commit AS gitCommit,b.import_mode AS importMode,
       b.status,b.added_count AS addedCount,b.duplicate_count AS duplicateCount,b.modified_count AS modifiedCount,b.removed_count AS removedCount,b.conflict_count AS conflictCount,b.created_at AS createdAt,
       b.project_id AS projectId,b.version_id AS versionId,b.module_id AS moduleId,p.name AS projectName,v.name AS versionName,m.name AS moduleName,
       group_concat(e.name,' · ') AS environmentNames
@@ -549,7 +646,6 @@ export async function POST(request:Request) {
       if (anchorEnvironmentId) {
         const environment=await db.prepare(`SELECT id,version_id AS versionId FROM catalog_environments WHERE id=? AND project_id=?`).bind(anchorEnvironmentId,recordId||clean(payload.id)||'').first<{id:string;versionId:string|null}>();
         if (!environment && recordId) return Response.json({ error:'锚定环境必须属于当前项目。' },{ status:400 });
-        if (environment && anchorVersionId && environment.versionId && environment.versionId!==anchorVersionId) return Response.json({ error:'锚定环境必须属于所选锚定版本。' },{ status:400 });
       }
       if (recordId) await db.prepare(`UPDATE catalog_projects SET code=?,name=?,kind=?,parent_id=?,icon=?,description=?,anchor_version_id=?,anchor_environment_id=? WHERE id=?`).bind(code,name,kind,clean(payload.parentId)||null,icon,clean(payload.description),anchorVersionId,anchorEnvironmentId,recordId).run();
       else await db.prepare(`INSERT INTO catalog_projects (id,code,name,kind,parent_id,icon,description,anchor_version_id,anchor_environment_id,archived,created_at) VALUES (?,?,?,?,?,?,?,?,?,0,?)`).bind(id(),code,name,kind,clean(payload.parentId)||null,icon,clean(payload.description),anchorVersionId,anchorEnvironmentId,now()).run();
@@ -594,10 +690,6 @@ export async function POST(request:Request) {
         const existing=await db.prepare(`SELECT project_id AS projectId,version_id AS versionId FROM catalog_environments WHERE id=?`).bind(recordId).first<{projectId:string;versionId:string|null}>();
         if (!existing) return Response.json({ error:'环境不存在。' },{ status:404 });
         if (existing.projectId!==projectId) return Response.json({ error:'已有环境不能移动到其他项目。' },{ status:400 });
-        if ((existing.versionId??'')!==versionId) {
-          const used=await db.prepare(`SELECT 1 AS found FROM table_scopes WHERE environment_id=? UNION ALL SELECT 1 FROM field_scopes WHERE environment_id=? UNION ALL SELECT 1 FROM import_batch_environments WHERE environment_id=? LIMIT 1`).bind(recordId,recordId,recordId).first();
-          if (used) return Response.json({ error:'已有结构或导入记录的环境不能直接更换版本。' },{ status:400 });
-        }
         await db.prepare(`UPDATE catalog_environments SET project_id=?,version_id=?,code=?,name=?,stage=?,sort_order=? WHERE id=?`).bind(projectId,versionId||null,code,name,clean(payload.stage)||'custom',Number(payload.sortOrder)||0,recordId).run();
       }
       else await db.prepare(`INSERT INTO catalog_environments VALUES (?,?,?,?,?,?,?,?,?)`).bind(id(),projectId,versionId||null,code,name,clean(payload.stage)||'custom',Number(payload.sortOrder)||0,0,now()).run();
@@ -894,8 +986,13 @@ export async function POST(request:Request) {
       validateScopeSelection(db,target.projectId,target.versionId,[target.environmentId]),
     ]);
     if (baseScopeError||targetScopeError) return Response.json({ error:baseScopeError||targetScopeError },{ status:400 });
+    const [baseSnapshot,targetSnapshot,focusTable]=await Promise.all([
+      latestSnapshotObjects(db,base),latestSnapshotObjects(db,target),
+      tableId?db.prepare(`SELECT name FROM catalog_tables WHERE id=?`).bind(tableId).first<{name:string}>():Promise.resolve(null),
+    ]);
     const focusSql=fieldId?' AND f.id=?':tableId?' AND f.table_id=?':'';const focusValue=fieldId||tableId;
-    const readFields=async(scope:CompareTarget)=>(await db.prepare(`SELECT f.id,f.code,f.name,t.name AS tableName,
+    const snapshotFields=(snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?.rows.filter((row)=>row.entity==='field').flatMap((row)=>{try{const field={...JSON.parse(row.definitionJson) as Omit<CompareField,'id'|'resolutionKind'|'reviewStatus'>,id:row.objectId??row.objectKey,resolutionKind:'same',reviewStatus:'confirmed'} as CompareField;return (!fieldId||field.id===fieldId)&&(!tableId||field.tableName.toLowerCase()===focusTable?.name.toLowerCase())?[field]:[];}catch{return [];}})??null;
+    const readFields=async(scope:CompareTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshotFields(snapshot)??(await db.prepare(`SELECT f.id,f.code,f.name,t.name AS tableName,
       CASE WHEN fr.id IS NOT NULL THEN fr.data_type ELSE f.data_type END AS dataType,
       CASE WHEN fr.id IS NOT NULL THEN fr.nullable ELSE f.nullable END AS nullable,
       CASE WHEN fr.id IS NOT NULL THEN fr.default_value ELSE f.default_value END AS defaultValue,
@@ -909,29 +1006,32 @@ export async function POST(request:Request) {
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='field' AND l.object_id=f.id AND l.project_id=? LIMIT 1),f.lifecycle_status,'active')='active'${focusSql}
       ORDER BY t.name,f.ordinal,f.name`).bind(scope.projectId,scope.versionId,scope.environmentId,scope.projectId,scope.projectId,...(focusValue?[focusValue]:[])).all<CompareField>()).results;
-    const [baseFields,targetFields]=await Promise.all([readFields(base),readFields(target)]);
-    const readTablePresence=async(scope:CompareTarget)=>{
+    const [baseFields,targetFields]=await Promise.all([readFields(base,baseSnapshot),readFields(target,targetSnapshot)]);
+    const readTablePresence=async(scope:CompareTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>{
       if (!tableId) return null;
+      if(snapshot) return snapshot.rows.some((row)=>row.entity==='table'&&(row.objectId===tableId||row.objectKey===focusTable?.name.toLowerCase()));
       const row=await db.prepare(`SELECT 1 AS present FROM table_scopes s JOIN catalog_tables t ON t.id=s.table_id
         WHERE s.table_id=? AND s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present'
           AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'
         LIMIT 1`).bind(tableId,scope.projectId,scope.versionId,scope.environmentId,scope.projectId).first<{present:number}>();
       return Boolean(row?.present);
     };
-    const [baseTablePresent,targetTablePresent]=await Promise.all([readTablePresence(base),readTablePresence(target)]);
-    const readIndexes=async(scope:CompareTarget)=>tableId?(await db.prepare(`SELECT i.id,i.name,i.kind,i.columns_json AS columnsJson
+    const [baseTablePresent,targetTablePresent]=await Promise.all([readTablePresence(base,baseSnapshot),readTablePresence(target,targetSnapshot)]);
+    const snapshotIndexes=(snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?.rows.filter((row)=>row.entity==='index').flatMap((row)=>{try{const item={id:row.objectId??row.objectKey,...JSON.parse(row.definitionJson) as {name:string;tableName:string;kind:string;columnsJson:string}};return (!tableId||item.tableName.toLowerCase()===focusTable?.name.toLowerCase())?[item]:[];}catch{return [];}})??null;
+    const readIndexes=async(scope:CompareTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshotIndexes(snapshot)??(tableId?(await db.prepare(`SELECT i.id,i.name,i.kind,i.columns_json AS columnsJson
       FROM catalog_index_scopes s JOIN catalog_indexes i ON i.id=s.index_id JOIN catalog_tables t ON t.id=i.table_id
       WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND i.table_id=?
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='index' AND l.object_id=i.id AND l.project_id=? LIMIT 1),i.lifecycle_status,'active')='active'
-      ORDER BY i.name`).bind(scope.projectId,scope.versionId,scope.environmentId,tableId,scope.projectId,scope.projectId).all<{id:string;name:string;kind:string;columnsJson:string}>()).results:[];
-    const readConstraints=async(scope:CompareTarget)=>tableId?(await db.prepare(`SELECT c.id,c.name,c.kind,c.definition
+      ORDER BY i.name`).bind(scope.projectId,scope.versionId,scope.environmentId,tableId,scope.projectId,scope.projectId).all<{id:string;name:string;kind:string;columnsJson:string}>()).results:[]);
+    const snapshotConstraints=(snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshot?.rows.filter((row)=>row.entity==='constraint').flatMap((row)=>{try{const item={id:row.objectId??row.objectKey,...JSON.parse(row.definitionJson) as {name:string;tableName:string;kind:string;definition:string}};return (!tableId||item.tableName.toLowerCase()===focusTable?.name.toLowerCase())?[item]:[];}catch{return [];}})??null;
+    const readConstraints=async(scope:CompareTarget,snapshot:Awaited<ReturnType<typeof latestSnapshotObjects>>)=>snapshotConstraints(snapshot)??(tableId?(await db.prepare(`SELECT c.id,c.name,c.kind,c.definition
       FROM catalog_constraint_scopes s JOIN catalog_constraints c ON c.id=s.constraint_id JOIN catalog_tables t ON t.id=c.table_id
       WHERE s.project_id=? AND s.version_id=? AND s.environment_id=? AND s.state='present' AND c.table_id=?
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='table' AND l.object_id=t.id AND l.project_id=? LIMIT 1),t.lifecycle_status,'active')='active'
         AND coalesce((SELECT l.status FROM catalog_object_lifecycles l WHERE l.entity='constraint' AND l.object_id=c.id AND l.project_id=? LIMIT 1),c.lifecycle_status,'active')='active'
-      ORDER BY c.name`).bind(scope.projectId,scope.versionId,scope.environmentId,tableId,scope.projectId,scope.projectId).all<{id:string;name:string;kind:string;definition:string}>()).results:[];
-    const [baseIndexes,targetIndexes,baseConstraints,targetConstraints]=await Promise.all([readIndexes(base),readIndexes(target),readConstraints(base),readConstraints(target)]);
+      ORDER BY c.name`).bind(scope.projectId,scope.versionId,scope.environmentId,tableId,scope.projectId,scope.projectId).all<{id:string;name:string;kind:string;definition:string}>()).results:[]);
+    const [baseIndexes,targetIndexes,baseConstraints,targetConstraints]=await Promise.all([readIndexes(base,baseSnapshot),readIndexes(target,targetSnapshot),readConstraints(base,baseSnapshot),readConstraints(target,targetSnapshot)]);
     const baseIndexMap=new Map(baseIndexes.map((item)=>[item.name.toLowerCase(),item]));const targetIndexMap=new Map(targetIndexes.map((item)=>[item.name.toLowerCase(),item]));
     const indexItems=[...new Set([...baseIndexMap.keys(),...targetIndexMap.keys()])].sort().map((indexKey)=>{const left=baseIndexMap.get(indexKey),right=targetIndexMap.get(indexKey);if(!left&&right)return {name:right.name,kind:right.kind,columnsJson:right.columnsJson,result:'added'};if(left&&!right)return {name:left.name,kind:left.kind,columnsJson:left.columnsJson,result:'removed'};const changed=left?.kind!==right?.kind||left?.columnsJson!==right?.columnsJson;return {name:right?.name??left?.name??indexKey,kind:right?.kind??left?.kind??'index',columnsJson:right?.columnsJson??left?.columnsJson??'[]',result:changed?'modified':'unchanged'};});
     const baseConstraintMap=new Map(baseConstraints.map((item)=>[item.name.toLowerCase(),item]));const targetConstraintMap=new Map(targetConstraints.map((item)=>[item.name.toLowerCase(),item]));
@@ -954,7 +1054,7 @@ export async function POST(request:Request) {
       return {tableName:right.tableName,columnName:right.name,fieldCode:right.code,result:changes.length?'modified':'unchanged',before:definition(left),after:definition(right),changes,resolutionKind:right.resolutionKind,reviewStatus:right.reviewStatus};
     });
     const summary=items.reduce((result,item)=>({...result,[item.result]:(result[item.result]??0)+1}),{} as Record<string,number>);
-    return Response.json({ok:true,items,summary,baseCount:baseFields.length,targetCount:targetFields.length,baseTablePresent,targetTablePresent,indexItems,constraintItems});
+    return Response.json({ok:true,items,summary,baseCount:baseFields.length,targetCount:targetFields.length,baseTablePresent,targetTablePresent,indexItems,constraintItems,baseSnapshot:baseSnapshot?.snapshot??null,targetSnapshot:targetSnapshot?.snapshot??null});
   }
 
   if (action === 'import.conflict.resolve') {
@@ -1024,6 +1124,11 @@ export async function POST(request:Request) {
     const parsed=parseMysqlSql(sql);
     if (!parsed.fields.length) return Response.json({ error:'没有识别到字段定义。',warnings:parsed.warnings },{ status:400 });
     if (parsed.warnings.length) return Response.json({ error:`有 ${parsed.warnings.length} 处 SQL 无法安全识别。${parsed.warnings[0]}`,warnings:parsed.warnings },{ status:400 });
+    const pureCreate=parsed.tables.length>0&&parsed.fields.every((field)=>field.action==='add')&&parsed.indexes.every((item)=>item.action==='add')&&parsed.constraints.every((item)=>item.action==='add');
+    const requestedMode=clean(payload.importMode);
+    const importMode=['snapshot','change','executed'].includes(requestedMode)?requestedMode:(pureCreate?'snapshot':'executed');
+    if(importMode==='snapshot'&&!pureCreate) return Response.json({error:'环境快照只接受完整 CREATE TABLE；ALTER SQL 请切换为变更计划或已执行记录。'},{status:400});
+    if(importMode==='snapshot'&&environmentIds.length!==1) return Response.json({error:'一份环境快照只能对应一个环境。需要采集多个环境时请分别导入。'},{status:400});
     const mappingRows=await db.prepare(`SELECT physical_name AS physicalName,logical_name AS logicalName FROM catalog_table_mappings WHERE project_id=?`).bind(projectId).all<{physicalName:string;logicalName:string}>();
     const mappings=new Map(mappingRows.results.map((row)=>[row.physicalName.toLowerCase(),row.logicalName.toLowerCase()]));
     const resolveTable=(name:string)=>mappings.get(name.toLowerCase())??name;
@@ -1037,7 +1142,7 @@ export async function POST(request:Request) {
     const createTables=new Set(normalizedParsed.tables.map((table)=>table.name.toLowerCase()));
     const incomingByTable=new Map<string,Set<string>>();
     normalizedParsed.fields.forEach((field)=>{
-      if (!createTables.has(field.tableName)) return;
+      if (!createTables.has(field.tableName.toLowerCase())) return;
       const names=incomingByTable.get(field.tableName)??new Set<string>();
       names.add(field.columnName.toLowerCase()); incomingByTable.set(field.tableName,names);
     });
@@ -1061,11 +1166,11 @@ export async function POST(request:Request) {
       if ((existing.defaultValue??null)!==(field.defaultValue??null)) changes.push(`默认值：${existing.defaultValue??'—'} → ${field.defaultValue??'—'}`);
       if ((existing.comment??'')!==(field.comment??'')) changes.push(`注释：${existing.comment||'—'} → ${field.comment||'—'}`);
       if ((existing.extra??'')!==(field.extra??'')) changes.push(`属性：${existing.extra||'—'} → ${field.extra||'—'}`);
-      if (!scopedFieldIds.has(existing.id)&&createTables.has(field.tableName)) {
-        items.push({tableName:field.tableName,columnName:field.columnName,result:changes.length?'conflict':'added',before:changes.length?definition(existing):null,after:definition(field),changes:changes.length?changes:['字段将登记到所选环境']});
+      if (!scopedFieldIds.has(existing.id)&&createTables.has(field.tableName.toLowerCase())) {
+        items.push({tableName:field.tableName,columnName:field.columnName,result:changes.length?'modified':'added',before:changes.length?definition(existing):null,after:definition(field),changes:changes.length?[...changes,'将作为该环境的实际修订保存']:['字段将登记到所选环境']});
         continue;
       }
-      const createSnapshot=createTables.has(field.tableName);
+      const createSnapshot=createTables.has(field.tableName.toLowerCase());
       const result=!changes.length?'unchanged':createSnapshot||field.action==='modify'||field.action==='change'?'modified':'conflict';
       items.push({tableName:field.tableName,columnName:field.columnName,result,before:definition(existing),after:definition(field),changes});
     }
@@ -1074,7 +1179,7 @@ export async function POST(request:Request) {
       existingRows.results.filter((field)=>field.tableName.toLowerCase()===table.name&&scopedFieldIds.has(field.id)&&!incoming.has(field.name.toLowerCase())).forEach((field)=>items.push({tableName:table.name,columnName:field.name,result:'removed',before:definition(field),after:null,changes:['建表语句中不存在该字段']}));
     }
     const summary=items.reduce((result,item)=>({...result,[item.result]:(result[item.result]??0)+1}),{} as Record<string,number>);
-    return Response.json({ok:true,items,summary,warnings:parsed.warnings});
+    return Response.json({ok:true,importMode,items,summary,warnings:parsed.warnings});
   }
 
   if (action === 'import.sql') {
@@ -1106,9 +1211,39 @@ export async function POST(request:Request) {
         constraints:parsed.constraints.map((item)=>({...item,tableName:resolve(item.tableName)})),
       };
     }
-    const fingerprint=await hash(`${projectId}|${versionId}|${environmentIds.sort().join(',')}|${sql.replace(/\s+/g,' ').trim()}`);
+    const pureCreate=parsed.tables.length>0&&parsed.fields.every((field)=>field.action==='add')&&parsed.indexes.every((item)=>item.action==='add')&&parsed.constraints.every((item)=>item.action==='add');
+    const requestedMode=clean(payload.importMode);
+    const importMode=['snapshot','change','executed'].includes(requestedMode)?requestedMode:(pureCreate?'snapshot':'executed');
+    if(importMode==='snapshot'&&!pureCreate) return Response.json({error:'环境快照只接受完整 CREATE TABLE；ALTER SQL 请切换为变更计划或已执行记录。'},{status:400});
+    if(importMode==='snapshot'&&environmentIds.length!==1) return Response.json({error:'一份环境快照只能对应一个环境。需要采集多个环境时请分别导入。'},{status:400});
+    if(importMode==='change'&&pureCreate) return Response.json({error:'CREATE TABLE 描述的是环境快照，不能登记成待发布变更。'},{status:400});
+    const fingerprint=await hash(`${importMode}|${projectId}|${versionId}|${environmentIds.sort().join(',')}|${sql.replace(/\s+/g,' ').trim()}`);
     const existingBatch=await db.prepare(`SELECT id,code FROM import_batches WHERE fingerprint=? AND status='active'`).bind(fingerprint).first<{id:string;code:string}>();
     if (existingBatch) return Response.json({ ok:true,duplicateBatch:true,batchCode:existingBatch.code,warnings:parsed.warnings });
+
+    // A planned change is intentionally non-mutating: it records executable
+    // work for the selected environments, but does not pretend their schema
+    // has already changed. Actual structure is updated only by an executed
+    // record or by a later environment snapshot.
+    if(importMode==='change') {
+      const batchId=id();const stamp=now();const batchDate=new Date(Date.now()+8*60*60*1000).toISOString().slice(0,10).replaceAll('-','');const batchCode=`CHS-${batchDate}-${batchId.slice(0,8).toUpperCase()}`;
+      const existingFields=(await db.prepare(`SELECT f.id,f.name,t.name AS tableName FROM catalog_fields f JOIN catalog_tables t ON t.id=f.table_id`).all<{id:string;name:string;tableName:string}>()).results;
+      const fieldMap=new Map(existingFields.map((field)=>[`${field.tableName.toLowerCase()}.${field.name.toLowerCase()}`,field]));
+      const statements:D1PreparedStatement[]=[];let added=0,modified=0,removed=0,conflicts=0,changeIndex=0;
+      const addPlanned=(actionName:string,tableName:string,objectName:string,fieldId:string|null)=>{
+        const changeId=id();const code=`CHG-${batchId}-${String(++changeIndex).padStart(3,'0')}`;
+        statements.push(db.prepare(`INSERT INTO catalog_changes (id,code,name,action,table_name,field_name,field_id,project_id,version_id,source_kind,source_path,git_commit,sql_text,import_batch_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(changeId,code,clean(payload.name)||batchCode,actionName,tableName,objectName,fieldId,projectId,versionId,sourceKind,sourcePath,gitCommit,sql,batchId,'planned',stamp));
+        environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT INTO catalog_change_scopes (change_id,environment_id,status) VALUES (?,?, 'pending')`).bind(changeId,environmentId)));
+      };
+      for(const field of parsed.fields){const existing=fieldMap.get(`${field.tableName.toLowerCase()}.${(field.previousName||field.columnName).toLowerCase()}`);if((field.action==='modify'||field.action==='change'||field.action==='drop')&&!existing){conflicts+=1;statements.push(importItem(db,batchId,field,null,'conflict','计划变更找不到原字段，请先核对目标环境或逻辑表映射。'));continue;}if(field.action==='add')added+=1;else if(field.action==='drop')removed+=1;else modified+=1;statements.push(importItem(db,batchId,field,existing?.id??null,'planned','已登记为待发布变更，尚未修改任何环境结构。'));addPlanned(field.action,field.tableName,field.columnName,existing?.id??null);}
+      for(const index of parsed.indexes){if(index.action==='drop')removed+=1;else added+=1;addPlanned(`${index.action}_index`,index.tableName,`索引 · ${index.name}`,null);}
+      for(const constraint of parsed.constraints){if(constraint.action==='drop')removed+=1;else added+=1;addPlanned(`${constraint.action}_constraint`,constraint.tableName,`约束 · ${constraint.name}`,null);}
+      statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,source_path,git_commit,fingerprint,raw_sql,import_mode,project_id,version_id,module_id,status,added_count,duplicate_count,modified_count,removed_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,0,?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'结构变更计划',sourceKind,clean(payload.fileName)||null,sourcePath,gitCommit,fingerprint,sql,importMode,projectId,versionId,moduleId,added,modified,removed,conflicts,stamp));
+      statements.splice(1,0,...environmentIds.map((environmentId)=>db.prepare(`INSERT INTO import_batch_environments (batch_id,environment_id) VALUES (?,?)`).bind(batchId,environmentId)));
+      statements.splice(1+environmentIds.length,0,...environmentIds.map((environmentId)=>db.prepare(`INSERT INTO catalog_sql_executions (id,import_batch_id,project_id,version_id,environment_id,status,sql_text,source_kind,source_path,git_commit,created_at,note) VALUES (?,?,?,?,?,'registered',?,?,?,?,?,'等待在该环境执行')`).bind(id(),batchId,projectId,versionId,environmentId,sql,sourceKind,sourcePath,gitCommit,stamp)));
+      await runChunked(db,statements);
+      return Response.json({ok:true,batchCode,importMode,added,duplicates:0,modified,removed,conflicts,warnings:parsed.warnings});
+    }
 
     const [tableRows,fieldRows,revisionRows,indexRows,constraintRows,indexRevisionRows,constraintRevisionRows]=await Promise.all([
       db.prepare(`SELECT id,code,name,comment,module_id AS moduleId FROM catalog_tables`).all<{id:string;code:string;name:string;comment:string;moduleId:string|null}>(),
@@ -1121,11 +1256,11 @@ export async function POST(request:Request) {
     ]);
     const tableMap=new Map(tableRows.results.map((item)=>[item.name.toLowerCase(),item]));
     const parsedTableMap=new Map(parsed.tables.map((item)=>[item.name,item]));
-    const createTableNames=new Set(parsed.tables.map((item)=>item.name));
+    const createTableNames=new Set(parsed.tables.map((item)=>item.name.toLowerCase()));
     const fieldMap=new Map(fieldRows.results.map((item)=>[`${item.tableName.toLowerCase()}.${item.name.toLowerCase()}`,item]));
     const revisionMap=new Map(revisionRows.results.map((item)=>[item.fieldId,Number(item.revision)||0]));
     const tableCodes=new Set(tableRows.results.map((item)=>item.code)); const fieldCodes=new Set(fieldRows.results.map((item)=>item.code));
-    const rolloutRows=await db.prepare(`SELECT id FROM catalog_environments WHERE project_id=? AND archived=0 AND (version_id=? OR version_id IS NULL)`).bind(projectId,versionId).all<{id:string}>();
+    const rolloutRows=await db.prepare(`SELECT id FROM catalog_environments WHERE project_id=? AND archived=0`).bind(projectId).all<{id:string}>();
     const rolloutEnvironmentIds=rolloutRows.results.map((item)=>item.id);
     const scopePlaceholders=environmentIds.map(()=>'?').join(',');
     const selectedScopeRows=await db.prepare(`SELECT DISTINCT field_id AS fieldId FROM field_scopes WHERE project_id=? AND version_id=? AND environment_id IN (${scopePlaceholders})`).bind(projectId,versionId,...environmentIds).all<{fieldId:string}>();
@@ -1133,7 +1268,7 @@ export async function POST(request:Request) {
     // A pure CREATE import is a snapshot of what already exists in the selected
     // environment. It may update that environment's revision, but it never
     // creates rollout work for the other environments.
-    const createSnapshot=parsed.tables.length>0 && parsed.fields.every((field)=>field.action==='add') && parsed.indexes.every((index)=>index.action==='add') && parsed.constraints.every((constraint)=>constraint.action==='add');
+    const createSnapshot=importMode==='snapshot';
     const indexMap=new Map(indexRows.results.map((item)=>[`${item.tableId}.${item.name.toLowerCase()}`,item]));
     const constraintMap=new Map(constraintRows.results.map((item)=>[`${item.tableId}.${item.name.toLowerCase()}`,item]));
     const indexRevisionMap=new Map(indexRevisionRows.results.map((item)=>[item.indexId,Number(item.revision)||0]));
@@ -1146,29 +1281,24 @@ export async function POST(request:Request) {
     let added=0,duplicates=0,modified=0,removed=0,conflicts=0,changeIndex=0;
 
     const markImportedFieldScopesVerified=(fieldId:string)=>{
-      // If an environment is imported again (for example, a second initial
-      // snapshot), close any stale pending marker for the same field. The
-      // import itself is the evidence that this environment now has the
-      // registered structure.
-      environmentIds.forEach((environmentId)=>{
-        const timestamp=now();
-        statements.push(db.prepare(`UPDATE catalog_change_scopes SET status='verified',executed_at=coalesce(executed_at,?),verified_at=coalesce(verified_at,?),note=? WHERE environment_id=? AND status='pending' AND change_id IN (SELECT id FROM catalog_changes WHERE field_id=? AND project_id=? AND version_id=?)`).bind(timestamp,timestamp,'已从导入快照确认该环境结构存在。',environmentId,fieldId,projectId,versionId));
-        statements.push(db.prepare(`UPDATE catalog_sql_executions SET status='verified',started_at=coalesce(started_at,?),finished_at=coalesce(finished_at,?),note=? WHERE environment_id=? AND status='registered' AND import_batch_id IN (SELECT import_batch_id FROM catalog_changes WHERE field_id=? AND project_id=? AND version_id=?)`).bind(timestamp,timestamp,'已从导入快照确认该环境结构存在。',environmentId,fieldId,projectId,versionId));
-      });
+      // Presence alone is not proof that the planned revision was applied.
+      // Verification is kept explicit until the captured fingerprint can be
+      // matched against the target change revision.
+      void fieldId;
     };
 
     const addChange=(parsedField:ParsedField,fieldId:string|null,status:string)=>{
       // Every CREATE TABLE statement is an observed snapshot. Only explicit
       // ALTER-style field changes are rollout work.
-      if (createTableNames.has(parsedField.tableName) || status==='duplicate'||status==='skipped') return;
+      if (createTableNames.has(parsedField.tableName.toLowerCase()) || status==='duplicate'||status==='skipped') return;
       const changeId=id();
       // change code must be globally unique, not only unique inside one batch.
       // The batch id is generated once per import and avoids collisions when
       // multiple imports happen on the same day (or a batch counter is reused).
       const changeCode=`CHG-${batchId}-${String(changeIndex+1).padStart(3,'0')}`;
       changeIndex+=1;
-      statements.push(db.prepare(`INSERT INTO catalog_changes (id,code,name,action,table_name,field_name,field_id,project_id,version_id,source_kind,source_path,git_commit,sql_text,import_batch_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(changeId,changeCode,clean(payload.name)||changeCode,parsedField.action,parsedField.tableName,parsedField.columnName,fieldId,projectId,versionId,sourceKind,sourcePath,gitCommit,`${parsedField.action.toUpperCase()} ${parsedField.tableName}.${parsedField.columnName}`,batchId,status==='conflict'?'conflict':'planned',now()));
-      rolloutEnvironmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO catalog_change_scopes (change_id,environment_id,status) VALUES (?,?,?)`).bind(changeId,environmentId,environmentIds.includes(environmentId)?'verified':'pending')));
+      statements.push(db.prepare(`INSERT INTO catalog_changes (id,code,name,action,table_name,field_name,field_id,project_id,version_id,source_kind,source_path,git_commit,sql_text,import_batch_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(changeId,changeCode,clean(payload.name)||changeCode,parsedField.action,parsedField.tableName,parsedField.columnName,fieldId,projectId,versionId,sourceKind,sourcePath,gitCommit,sql,batchId,status==='conflict'?'conflict':'planned',now()));
+      rolloutEnvironmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO catalog_change_scopes (change_id,environment_id,status) VALUES (?,?,?)`).bind(changeId,environmentId,environmentIds.includes(environmentId)?'executed':'pending')));
     };
 
     for (const parsedField of parsed.fields) {
@@ -1202,10 +1332,22 @@ export async function POST(request:Request) {
       if (existing) {
         const selectedInScope=selectedScopeFieldIds.has(existing.id);
         const existingFingerprint=fieldFingerprint({ tableName:parsedField.tableName,columnName:existing.name,dataType:existing.dataType,nullable:Boolean(existing.nullable),defaultValue:existing.defaultValue,comment:existing.comment,extra:existing.extra });
+        if(createSnapshot) {
+          const matchingRevision=await db.prepare(`SELECT id AS revisionId FROM catalog_field_revisions WHERE field_id=? AND fingerprint=? ORDER BY revision DESC LIMIT 1`).bind(existing.id,incomingFingerprint).first<{revisionId:string}>();
+          let revisionId=matchingRevision?.revisionId??'';
+          if(!revisionId){const nextRevision=(revisionMap.get(existing.id)??0)+1;revisionId=`${existing.id}:r${nextRevision}`;statements.push(db.prepare(`INSERT INTO catalog_field_revisions (id,field_id,revision,data_type,nullable,default_value,comment,extra,ordinal,source_kind,import_batch_id,fingerprint,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(revisionId,existing.id,nextRevision,parsedField.dataType,parsedField.nullable?1:0,parsedField.defaultValue,parsedField.comment,parsedField.extra,parsedField.ordinal,sourceKind,batchId,incomingFingerprint,now()));revisionMap.set(existing.id,nextRevision);}
+          environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present',?,?,?)`).bind(existing.id,projectId,versionId,environmentId,sourceKind,batchId,now()),db.prepare(`INSERT OR REPLACE INTO catalog_field_scope_revisions (field_id,version_id,environment_id,revision_id,resolution_kind,review_status,resolution_note,updated_at) VALUES (?,?,?,?,?,?,?,?)`).bind(existing.id,versionId,environmentId,revisionId,incomingFingerprint===existingFingerprint?'same':'variant','confirmed',incomingFingerprint===existingFingerprint?'':'该环境快照保存了不同的实际字段定义。',now())));
+          markImportedFieldScopesVerified(existing.id);
+          const result=incomingFingerprint!==existingFingerprint?'modified':selectedInScope?'duplicate':'added';
+          if(result==='modified')modified+=1;else if(result==='added')added+=1;else duplicates+=1;
+          statements.push(importItem(db,batchId,parsedField,existing.id,result,result==='modified'?'发现环境结构差异，已作为该环境的实际修订保存。':result==='added'?'字段定义相同，已登记到该环境。':'该环境中的字段定义没有变化。'));
+          selectedScopeFieldIds.add(existing.id);
+          continue;
+        }
         // A CREATE snapshot should only revise a field that already exists in
         // the selected project/version/environment scope. A shared canonical
         // field from another scope is merely registered here, not rewritten.
-        if (parsedField.action==='modify'||parsedField.action==='change'||(createTableNames.has(parsedField.tableName)&&selectedInScope&&incomingFingerprint!==existingFingerprint)) {
+        if (parsedField.action==='modify'||parsedField.action==='change'||(createTableNames.has(parsedField.tableName.toLowerCase())&&selectedInScope&&incomingFingerprint!==existingFingerprint)) {
           const targetKey=`${parsedField.tableName}.${parsedField.columnName.toLowerCase()}`;
           const renamedConflict=parsedField.action==='change'&&targetKey!==key&&fieldMap.has(targetKey);
           if (renamedConflict) { conflicts+=1;statements.push(importItem(db,batchId,parsedField,existing.id,'conflict','目标字段名已经存在，未执行重命名。'));continue; }
@@ -1217,7 +1359,7 @@ export async function POST(request:Request) {
           statements.push(db.prepare(`INSERT INTO catalog_field_revisions (id,field_id,revision,data_type,nullable,default_value,comment,extra,ordinal,source_kind,import_batch_id,fingerprint,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(revisionId,existing.id,nextRevision,parsedField.dataType,parsedField.nullable?1:0,parsedField.defaultValue,parsedField.comment,parsedField.extra,parsedField.ordinal,sourceKind,batchId,fieldFingerprint(incomingDefinition),now()));
           environmentIds.forEach((environmentId)=>statements.push(db.prepare(`INSERT OR IGNORE INTO field_scopes VALUES (?,?,?,?, 'present',?,?,?)`).bind(existing.id,projectId,versionId,environmentId,sourceKind,batchId,now()),db.prepare(`INSERT OR REPLACE INTO catalog_field_scope_revisions (field_id,version_id,environment_id,revision_id,updated_at) VALUES (?,?,?,?,?)`).bind(existing.id,versionId,environmentId,revisionId,now())));
           revisionMap.set(existing.id,nextRevision);
-          statements.push(importItem(db,batchId,parsedField,existing.id,'modified',parsedField.action==='change'?'已更新字段名称和定义，并登记到所选环境。':createTableNames.has(parsedField.tableName)?'已根据建表语句同步字段定义，并登记到所选环境。':'已更新字段定义，并登记到所选环境。',{field:existing}));
+          statements.push(importItem(db,batchId,parsedField,existing.id,'modified',parsedField.action==='change'?'已更新字段名称和定义，并登记到所选环境。':createTableNames.has(parsedField.tableName.toLowerCase())?'已根据环境快照保存该环境的字段修订。':'已更新字段定义，并登记到所选环境。',{field:existing}));
           addChange(parsedField,existing.id,'modified');
           fieldMap.delete(key);
           fieldMap.set(targetKey,{...existing,name:parsedField.columnName.toLowerCase(),dataType:parsedField.dataType,nullable:parsedField.nullable?1:0,defaultValue:parsedField.defaultValue,comment:parsedField.comment,extra:parsedField.extra,ordinal:parsedField.ordinal});
@@ -1304,11 +1446,13 @@ export async function POST(request:Request) {
         objectIds.forEach((objectId) => statements.push(db.prepare(`INSERT INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(entity,object_id,project_id) DO UPDATE SET status=excluded.status,note=excluded.note,updated_at=excluded.updated_at`).bind(entity,objectId,projectId,lifecycleStatus,lifecycleNote,now())));
       });
     }
-    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,source_path,git_commit,fingerprint,raw_sql,project_id,version_id,module_id,status,added_count,duplicate_count,modified_count,removed_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||'SQL 导入',sourceKind,clean(payload.fileName)||null,sourcePath,gitCommit,fingerprint,sql,projectId,versionId,moduleId,added,duplicates,modified,removed,conflicts,now()));
+    statements.unshift(db.prepare(`INSERT INTO import_batches (id,code,name,source_kind,file_name,source_path,git_commit,fingerprint,raw_sql,import_mode,project_id,version_id,module_id,status,added_count,duplicate_count,modified_count,removed_count,conflict_count,created_at,reverted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,NULL)`).bind(batchId,batchCode,clean(payload.name)||clean(payload.fileName)||(createSnapshot?'环境结构快照':'已执行 SQL'),sourceKind,clean(payload.fileName)||null,sourcePath,gitCommit,fingerprint,sql,importMode,projectId,versionId,moduleId,added,duplicates,modified,removed,conflicts,now()));
     statements.splice(1,0,...environmentIds.map((environmentId)=>db.prepare(`INSERT OR IGNORE INTO import_batch_environments (batch_id,environment_id) VALUES (?,?)`).bind(batchId,environmentId)));
-    statements.splice(1+environmentIds.length,0,...environmentIds.map((environmentId)=>db.prepare(`INSERT INTO catalog_sql_executions (id,import_batch_id,project_id,version_id,environment_id,status,sql_text,source_kind,source_path,git_commit,created_at,started_at,finished_at,note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id(),batchId,projectId,versionId,environmentId,createSnapshot?'verified':'registered',sql,sourceKind,sourcePath,gitCommit,now(),createSnapshot?now():null,createSnapshot?now():null,createSnapshot?'初始化快照已确认该环境结构存在。':'等待在该环境执行')));
+    statements.splice(1+environmentIds.length,0,...environmentIds.map((environmentId)=>{const stamp=now();const executionStatus=createSnapshot?'verified':'executed';return db.prepare(`INSERT INTO catalog_sql_executions (id,import_batch_id,project_id,version_id,environment_id,status,sql_text,source_kind,source_path,git_commit,created_at,started_at,finished_at,note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id(),batchId,projectId,versionId,environmentId,executionStatus,sql,sourceKind,sourcePath,gitCommit,stamp,stamp,createSnapshot?stamp:null,createSnapshot?'环境快照已采集并确认。':'已登记为在该环境执行，等待结构快照验证。');}));
     await runChunked(db,statements);
-    return Response.json({ ok:true,batchCode,added,duplicates,modified,removed,conflicts,warnings:parsed.warnings });
+    const snapshots=createSnapshot?await Promise.all(environmentIds.map((environmentId)=>captureEnvironmentSnapshot(db,{projectId,versionId,environmentId,importBatchId:batchId,sourceKind}))):[];
+    const verifiedChanges=createSnapshot?(await Promise.all(environmentIds.map((environmentId)=>verifyChangesAgainstSnapshot(db,{projectId,versionId,environmentId})))).reduce((sum,count)=>sum+count,0):0;
+    return Response.json({ ok:true,batchCode,importMode,snapshots,verifiedChanges,added,duplicates,modified,removed,conflicts,warnings:parsed.warnings });
   }
 
   if (action === 'import.revert') {
@@ -1345,6 +1489,7 @@ export async function POST(request:Request) {
     }
     const statements:D1PreparedStatement[]=[];
     fields.forEach((field)=>statements.push(db.prepare(`DELETE FROM catalog_fields WHERE id=? AND NOT EXISTS (SELECT 1 FROM field_scopes WHERE field_id=?)`).bind(field.id,field.id)));
+    statements.push(db.prepare(`DELETE FROM catalog_snapshots WHERE import_batch_id=?`).bind(batchId));
     statements.push(db.prepare(`DELETE FROM catalog_tables WHERE import_batch_id=? AND NOT EXISTS (SELECT 1 FROM catalog_fields WHERE table_id=catalog_tables.id)`).bind(batchId));
     statements.push(db.prepare(`DELETE FROM catalog_changes WHERE import_batch_id=?`).bind(batchId));
     statements.push(db.prepare(`UPDATE catalog_sql_executions SET status='waived',finished_at=coalesce(finished_at,?),note='对应导入记录已撤销。' WHERE import_batch_id=?`).bind(now(),batchId));
@@ -1353,7 +1498,7 @@ export async function POST(request:Request) {
   }
 
   if (action === 'catalog.reset') {
-    await db.batch([db.prepare(`DELETE FROM catalog_change_scopes`),db.prepare(`DELETE FROM catalog_changes`),db.prepare(`DELETE FROM catalog_sql_executions`),db.prepare(`DELETE FROM catalog_field_scope_revisions`),db.prepare(`DELETE FROM catalog_field_revisions`),db.prepare(`DELETE FROM catalog_index_revisions`),db.prepare(`DELETE FROM catalog_index_scopes`),db.prepare(`DELETE FROM catalog_constraint_revisions`),db.prepare(`DELETE FROM catalog_constraint_scopes`),db.prepare(`DELETE FROM field_scopes`),db.prepare(`DELETE FROM table_scopes`),db.prepare(`DELETE FROM import_items`),db.prepare(`DELETE FROM import_batch_environments`),db.prepare(`DELETE FROM import_batches`),db.prepare(`DELETE FROM catalog_constraints`),db.prepare(`DELETE FROM catalog_indexes`),db.prepare(`DELETE FROM catalog_fields`),db.prepare(`DELETE FROM catalog_tables`)]);
+    await db.batch([db.prepare(`DELETE FROM catalog_snapshot_objects`),db.prepare(`DELETE FROM catalog_snapshots`),db.prepare(`DELETE FROM catalog_change_scopes`),db.prepare(`DELETE FROM catalog_changes`),db.prepare(`DELETE FROM catalog_sql_executions`),db.prepare(`DELETE FROM catalog_field_scope_revisions`),db.prepare(`DELETE FROM catalog_field_revisions`),db.prepare(`DELETE FROM catalog_index_revisions`),db.prepare(`DELETE FROM catalog_index_scopes`),db.prepare(`DELETE FROM catalog_constraint_revisions`),db.prepare(`DELETE FROM catalog_constraint_scopes`),db.prepare(`DELETE FROM field_scopes`),db.prepare(`DELETE FROM table_scopes`),db.prepare(`DELETE FROM import_items`),db.prepare(`DELETE FROM import_batch_environments`),db.prepare(`DELETE FROM import_batches`),db.prepare(`DELETE FROM catalog_constraints`),db.prepare(`DELETE FROM catalog_indexes`),db.prepare(`DELETE FROM catalog_fields`),db.prepare(`DELETE FROM catalog_tables`)]);
     return Response.json({ ok:true });
   }
 

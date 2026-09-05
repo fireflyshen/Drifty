@@ -43,11 +43,15 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS idx_catalog_changes_version ON catalog_changes(version_id)`,
   `CREATE TABLE IF NOT EXISTS catalog_change_scopes (change_id text NOT NULL, environment_id text NOT NULL, status text DEFAULT 'pending' NOT NULL, executed_at text, verified_at text, note text DEFAULT '' NOT NULL, PRIMARY KEY(change_id,environment_id), FOREIGN KEY(change_id) REFERENCES catalog_changes(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_catalog_change_scopes_environment ON catalog_change_scopes(environment_id)`,
-  `CREATE TABLE IF NOT EXISTS import_batches (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, source_kind text NOT NULL, file_name text, source_path text, git_commit text, fingerprint text NOT NULL, raw_sql text DEFAULT '' NOT NULL, project_id text NOT NULL, version_id text NOT NULL, module_id text, status text DEFAULT 'active' NOT NULL, added_count integer DEFAULT 0 NOT NULL, duplicate_count integer DEFAULT 0 NOT NULL, modified_count integer DEFAULT 0 NOT NULL, removed_count integer DEFAULT 0 NOT NULL, conflict_count integer DEFAULT 0 NOT NULL, created_at text NOT NULL, reverted_at text, FOREIGN KEY(project_id) REFERENCES catalog_projects(id), FOREIGN KEY(version_id) REFERENCES catalog_versions(id), FOREIGN KEY(module_id) REFERENCES catalog_modules(id))`,
+  `CREATE TABLE IF NOT EXISTS import_batches (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, name text NOT NULL, source_kind text NOT NULL, file_name text, source_path text, git_commit text, fingerprint text NOT NULL, raw_sql text DEFAULT '' NOT NULL, import_mode text DEFAULT 'snapshot' NOT NULL, project_id text NOT NULL, version_id text NOT NULL, module_id text, status text DEFAULT 'active' NOT NULL, added_count integer DEFAULT 0 NOT NULL, duplicate_count integer DEFAULT 0 NOT NULL, modified_count integer DEFAULT 0 NOT NULL, removed_count integer DEFAULT 0 NOT NULL, conflict_count integer DEFAULT 0 NOT NULL, created_at text NOT NULL, reverted_at text, FOREIGN KEY(project_id) REFERENCES catalog_projects(id), FOREIGN KEY(version_id) REFERENCES catalog_versions(id), FOREIGN KEY(module_id) REFERENCES catalog_modules(id))`,
   `CREATE TABLE IF NOT EXISTS import_items (id text PRIMARY KEY NOT NULL, batch_id text NOT NULL, statement_no integer NOT NULL, action text NOT NULL, table_name text NOT NULL, column_name text NOT NULL, field_id text, result text NOT NULL, message text DEFAULT '' NOT NULL, fingerprint text NOT NULL, before_snapshot text, FOREIGN KEY(batch_id) REFERENCES import_batches(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_import_items_batch ON import_items(batch_id)`,
   `CREATE TABLE IF NOT EXISTS import_batch_environments (batch_id text NOT NULL, environment_id text NOT NULL, PRIMARY KEY(batch_id,environment_id), FOREIGN KEY(batch_id) REFERENCES import_batches(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS idx_import_batch_environments_environment ON import_batch_environments(environment_id)`,
+  `CREATE TABLE IF NOT EXISTS catalog_snapshots (id text PRIMARY KEY NOT NULL, code text NOT NULL UNIQUE, project_id text NOT NULL, version_id text NOT NULL, environment_id text NOT NULL, import_batch_id text NOT NULL, fingerprint text NOT NULL, source_kind text NOT NULL, captured_at text NOT NULL, FOREIGN KEY(project_id) REFERENCES catalog_projects(id) ON DELETE CASCADE, FOREIGN KEY(version_id) REFERENCES catalog_versions(id) ON DELETE CASCADE, FOREIGN KEY(environment_id) REFERENCES catalog_environments(id) ON DELETE CASCADE, FOREIGN KEY(import_batch_id) REFERENCES import_batches(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_snapshots_scope ON catalog_snapshots(project_id,version_id,environment_id,captured_at)`,
+  `CREATE TABLE IF NOT EXISTS catalog_snapshot_objects (snapshot_id text NOT NULL, entity text NOT NULL, object_key text NOT NULL, object_id text, revision_id text, fingerprint text NOT NULL, definition_json text NOT NULL, PRIMARY KEY(snapshot_id,entity,object_key), FOREIGN KEY(snapshot_id) REFERENCES catalog_snapshots(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_snapshot_objects_key ON catalog_snapshot_objects(entity,object_key)`,
   `INSERT OR IGNORE INTO import_batch_environments (batch_id,environment_id) SELECT DISTINCT import_batch_id,environment_id FROM field_scopes WHERE import_batch_id IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS repository_sources (id text PRIMARY KEY NOT NULL, name text NOT NULL, repository text NOT NULL, branch text DEFAULT 'main' NOT NULL, path_pattern text NOT NULL, project_id text, last_commit text, enabled integer DEFAULT 1 NOT NULL, created_at text NOT NULL)`,
   `PRAGMA optimize`,
@@ -119,6 +123,7 @@ export async function ensureDatabase() {
   if (!importColumns.results.some((column) => column.name === 'git_commit')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN git_commit text`));
   if (!importColumns.results.some((column) => column.name === 'modified_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN modified_count integer DEFAULT 0 NOT NULL`));
   if (!importColumns.results.some((column) => column.name === 'removed_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN removed_count integer DEFAULT 0 NOT NULL`));
+  if (!importColumns.results.some((column) => column.name === 'import_mode')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN import_mode text DEFAULT 'snapshot' NOT NULL`));
   if (!importItemColumns.results.some((column) => column.name === 'before_snapshot')) alterations.push(db.prepare(`ALTER TABLE import_items ADD COLUMN before_snapshot text`));
   if (!changeColumns.results.some((column) => column.name === 'import_batch_id')) alterations.push(db.prepare(`ALTER TABLE catalog_changes ADD COLUMN import_batch_id text`));
   if (!tableColumns.results.some((column) => column.name === 'lifecycle_status')) alterations.push(db.prepare(`ALTER TABLE catalog_tables ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`));
@@ -135,6 +140,11 @@ export async function ensureDatabase() {
   if (!fieldScopeRevisionColumns.results.some((column) => column.name === 'import_item_id')) alterations.push(db.prepare(`ALTER TABLE catalog_field_scope_revisions ADD COLUMN import_item_id text`));
   if (alterations.length) await db.batch(alterations);
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_versions_repository ON catalog_versions(repository_id)`).run();
+  const importModeMarker=await db.prepare(`SELECT value FROM runtime_meta WHERE key='import_mode_backfill_v1'`).first();
+  if(!importModeMarker){await db.batch([
+    db.prepare(`UPDATE import_batches SET import_mode=CASE WHEN lower(coalesce(raw_sql,'')) LIKE '%alter table%' THEN 'executed' ELSE 'snapshot' END`),
+    db.prepare(`INSERT OR REPLACE INTO runtime_meta (key,value) VALUES ('import_mode_backfill_v1',?)`).bind(new Date().toISOString()),
+  ]);}
   const tableScopeMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='table_scope_backfill_v1'`).first();
   if (!tableScopeMarker) {
     await db.batch([

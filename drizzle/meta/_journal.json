@@ -71,6 +71,13 @@
       "when": 1788019200000,
       "tag": "0009_scope_conflict_resolution",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1788615774180,
+      "tag": "0010_smiling_wither",
+      "breakpoints": true
     }
   ]
 }

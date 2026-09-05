@@ -579,6 +579,7 @@ export const importBatches = sqliteTable("import_batches", {
   gitCommit: text("git_commit"),
   fingerprint: text("fingerprint").notNull(),
   rawSql: text("raw_sql").notNull().default(""),
+  importMode: text("import_mode").notNull().default("snapshot"),
   projectId: text("project_id")
     .notNull()
     .references(() => catalogProjects.id),
@@ -595,6 +596,66 @@ export const importBatches = sqliteTable("import_batches", {
   createdAt: text("created_at").notNull(),
   revertedAt: text("reverted_at"),
 });
+
+/**
+ * An immutable observation of one environment at one product version.
+ *
+ * A snapshot is deliberately separate from a rollout change: importing
+ * SHOW CREATE TABLE describes what already exists and must never create
+ * pending release work by itself.
+ */
+export const catalogSnapshots = sqliteTable(
+  "catalog_snapshots",
+  {
+    id: text("id").primaryKey(),
+    code: text("code").notNull().unique(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => catalogProjects.id, { onDelete: "cascade" }),
+    versionId: text("version_id")
+      .notNull()
+      .references(() => catalogVersions.id, { onDelete: "cascade" }),
+    environmentId: text("environment_id")
+      .notNull()
+      .references(() => catalogEnvironments.id, { onDelete: "cascade" }),
+    importBatchId: text("import_batch_id")
+      .notNull()
+      .references(() => importBatches.id, { onDelete: "cascade" }),
+    fingerprint: text("fingerprint").notNull(),
+    sourceKind: text("source_kind").notNull(),
+    capturedAt: text("captured_at").notNull(),
+  },
+  (table) => [
+    index("idx_catalog_snapshots_scope").on(
+      table.projectId,
+      table.versionId,
+      table.environmentId,
+      table.capturedAt,
+    ),
+  ],
+);
+
+export const catalogSnapshotObjects = sqliteTable(
+  "catalog_snapshot_objects",
+  {
+    snapshotId: text("snapshot_id")
+      .notNull()
+      .references(() => catalogSnapshots.id, { onDelete: "cascade" }),
+    entity: text("entity").notNull(),
+    objectKey: text("object_key").notNull(),
+    objectId: text("object_id"),
+    revisionId: text("revision_id"),
+    fingerprint: text("fingerprint").notNull(),
+    definitionJson: text("definition_json").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.snapshotId, table.entity, table.objectKey] }),
+    index("idx_catalog_snapshot_objects_key").on(
+      table.entity,
+      table.objectKey,
+    ),
+  ],
+);
 
 export const importItems = sqliteTable(
   "import_items",

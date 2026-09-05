@@ -310,6 +310,7 @@ type ImportBatch = {
   code: string;
   name: string;
   sourceKind: string;
+  importMode?: "snapshot" | "change" | "executed";
   fileName: string | null;
   sourcePath?: string | null;
   gitCommit?: string | null;
@@ -361,10 +362,12 @@ type ImportPreviewItem = {
   reviewStatus?: "confirmed" | "pending";
 };
 type ImportPreview = {
+  importMode?: "snapshot" | "change" | "executed";
   items: ImportPreviewItem[];
   summary: Record<string, number>;
   signature: string;
 };
+type ImportMode = "snapshot" | "change" | "executed";
 type ScopePreview = {
   items: ImportPreviewItem[];
   summary: Record<string, number>;
@@ -505,6 +508,9 @@ type ReleaseChange = {
   tableName: string;
   fieldName: string;
   fieldId: string | null;
+  importBatchId: string | null;
+  batchName: string;
+  batchTotal: number;
   projectId: string;
   versionId: string;
   sourceKind: string;
@@ -540,7 +546,7 @@ type ReleaseGroup = {
   key: string;
   projectName: string;
   versionName: string;
-  tableName: string;
+  name: string;
   changes: ReleaseChange[];
 };
 type View = "explorer" | "projects" | "release" | "imports" | "settings";
@@ -1024,6 +1030,7 @@ export default function Home() {
   const [scopeVersion, setScopeVersion] = useState("");
   const [scopeEnvs, setScopeEnvs] = useState<string[]>([]);
   const [importName, setImportName] = useState("");
+  const [importMode, setImportMode] = useState<ImportMode>("snapshot");
   const [importSql, setImportSql] = useState("");
   const [importFile, setImportFile] = useState("");
   const [importModule, setImportModule] = useState("");
@@ -1180,7 +1187,8 @@ export default function Home() {
   const chooseScopeProject = (projectId: string) => {
     setScopeProject(projectId);
     setScopeVersion(projectVersions(projectId)[0]?.id ?? "");
-    setScopeEnvs(projectEnvs(projectId).map((item) => item.id));
+    const ids=projectEnvs(projectId).map((item) => item.id);
+    setScopeEnvs(importMode==="snapshot"?ids.slice(0,1):ids);
   };
   const go = (next: View) => {
     closeDetail();
@@ -1380,6 +1388,7 @@ export default function Home() {
     try {
       const result = await call("import.sql", {
         name: importName,
+        importMode,
         sql: importSql,
         sourceKind:
           importSourcePath || importGitCommit
@@ -1420,13 +1429,10 @@ export default function Home() {
     if (!files?.length) return;
     const selected = Array.from(files);
     setImportFile(selected.map((file) => file.name).join(", "));
-    setImportSql(
-      (
-        await Promise.all(
-          selected.map(async (file) => `-- ${file.name}\n${await file.text()}`),
-        )
-      ).join("\n\n"),
-    );
+    const next=(await Promise.all(selected.map(async (file) => `-- ${file.name}\n${await file.text()}`))).join("\n\n");
+    setImportSql(next);
+    if(/\bALTER\s+TABLE\b/i.test(next))setImportMode("executed");
+    else if(/\bCREATE\s+TABLE\b/i.test(next)){setImportMode("snapshot");setScopeEnvs((current)=>current.slice(0,1));}
   };
   const reuseImport = (batch: ImportBatch) => {
     closeDetail();
@@ -1435,6 +1441,7 @@ export default function Home() {
     setScopeVersion(batch.versionId);
     setScopeEnvs((batch.environmentIds ?? "").split("|||").filter(Boolean));
     setImportModule(batch.moduleId ?? "");
+    setImportMode(batch.importMode ?? (/\bALTER\s+TABLE\b/i.test(batch.rawSql ?? "") ? "executed" : "snapshot"));
     setImportName(
       locale === "zh" ? `${batch.name} · 再次执行` : `${batch.name} · rerun`,
     );
@@ -1635,6 +1642,7 @@ export default function Home() {
                 scopeVersion={scopeVersion}
                 scopeEnvs={scopeEnvs}
                 importName={importName}
+                importMode={importMode}
                 importSql={importSql}
                 importFile={importFile}
                 importSourcePath={importSourcePath}
@@ -1646,6 +1654,7 @@ export default function Home() {
                 setScopeVersion={setScopeVersion}
                 setScopeEnvs={setScopeEnvs}
                 setImportName={setImportName}
+                setImportMode={setImportMode}
                 setImportSql={setImportSql}
                 setImportSourcePath={setImportSourcePath}
                 setImportGitCommit={setImportGitCommit}
@@ -2811,7 +2820,6 @@ function ScopeCoverage({
   const matchingEnvironments = environments.filter(
     (environment) =>
       (!selectedProjectIds.length || selectedProjectIds.includes(environment.projectId)) &&
-      (!versionId || !environment.versionId || environment.versionId === versionId) &&
       (!selectedEnvironmentIds.length || selectedEnvironmentIds.includes(environment.id)),
   );
   const presence = matchingEnvironments.map((environment) => {
@@ -2822,7 +2830,7 @@ function ScopeCoverage({
         (!versionId || scope.versionId === versionId) &&
         scope.state === "present",
     );
-    const version = versions.find((item) => item.id === (environment.versionId || versionId));
+    const version = versions.find((item) => item.id === (versionId || environment.versionId));
     return { environment, version, present };
   });
   const projectCount = new Set(scopes.map((scope) => scope.projectId)).size;
@@ -3731,9 +3739,7 @@ function TableDetail({
                 <div className="divide-y">
                   {projectVersions.map((version) => {
                     const envs = environments.filter(
-                      (env) =>
-                        env.projectId === project.id &&
-                        (!env.versionId || env.versionId === version.id),
+                      (env) => env.projectId === project.id,
                     );
                     return (
                       <div
@@ -4064,9 +4070,7 @@ function FieldDetail({
                 <div className="divide-y">
                   {projectVersions.map((version) => {
                     const envs = environments.filter(
-                      (env) =>
-                        env.projectId === project.id &&
-                        (!env.versionId || env.versionId === version.id),
+                      (env) => env.projectId === project.id,
                     );
                     return (
                       <div
@@ -5153,6 +5157,13 @@ function ImportDetail({
       </SheetHeader>
       <div className="border-b px-6 py-4">
         <div className="flex flex-wrap gap-1.5">
+          <Badge variant="outline">
+            {batch.importMode==="change"
+              ? locale === "zh" ? "变更计划" : "Change plan"
+              : batch.importMode==="executed"
+                ? locale === "zh" ? "已执行记录" : "Executed SQL"
+                : locale === "zh" ? "环境快照" : "Snapshot"}
+          </Badge>
           <Badge variant="secondary">
             {locale === "zh"
               ? `新增 ${batch.addedCount}`
@@ -5492,6 +5503,7 @@ function ImportWorkspace({
   scopeVersion,
   scopeEnvs,
   importName,
+  importMode,
   importSql,
   importFile,
   importSourcePath,
@@ -5503,6 +5515,7 @@ function ImportWorkspace({
   setScopeVersion,
   setScopeEnvs,
   setImportName,
+  setImportMode,
   setImportSql,
   setImportSourcePath,
   setImportGitCommit,
@@ -5521,6 +5534,7 @@ function ImportWorkspace({
   scopeVersion: string;
   scopeEnvs: string[];
   importName: string;
+  importMode: ImportMode;
   importSql: string;
   importFile: string;
   importSourcePath: string;
@@ -5532,6 +5546,7 @@ function ImportWorkspace({
   setScopeVersion: (id: string) => void;
   setScopeEnvs: (ids: string[]) => void;
   setImportName: (name: string) => void;
+  setImportMode: (mode: ImportMode) => void;
   setImportSql: (sql: string) => void;
   setImportSourcePath: (path: string) => void;
   setImportGitCommit: (commit: string) => void;
@@ -5583,7 +5598,7 @@ function ImportWorkspace({
     if (!importSql || !scopeProject || !versionId || !environmentId) return;
     setPreviewing(true);
     try {
-      const signature = `${scopeProject}|${versionId}|${environmentId}|${importSql}`;
+      const signature = `${importMode}|${scopeProject}|${versionId}|${environmentId}|${importSql}`;
       const response = await fetch("/api/catalog", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -5591,6 +5606,7 @@ function ImportWorkspace({
           action: "import.preview",
           payload: {
             sql: importSql,
+            importMode,
             projectId: scopeProject,
             versionId,
             environmentIds: [environmentId],
@@ -5609,7 +5625,8 @@ function ImportWorkspace({
       setPreview({ ...result, signature });
       setPreviewTarget({ versionId, environmentId });
       setScopeVersion(versionId);
-      setScopeEnvs([environmentId]);
+      if(importMode==="snapshot")setScopeEnvs([environmentId]);
+      else if(!scopeEnvs.includes(environmentId))setScopeEnvs([...scopeEnvs,environmentId]);
       setPreviewOpen(true);
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error));
@@ -5620,18 +5637,14 @@ function ImportWorkspace({
   const prepareImport = async () => {
     if (!ready) return;
     const versionId = scopeVersion;
-    const matching = projectEnvs(scopeProject).filter(
-      (env) => !env.versionId || env.versionId === versionId,
-    );
+    const matching = projectEnvs(scopeProject);
     const environmentId =
       scopeEnvs.find((id) => matching.some((env) => env.id === id)) ??
       matching[0]?.id;
     if (environmentId) await requestPreview(versionId, environmentId);
   };
   const choosePreviewVersion = (versionId: string) => {
-    const environment = projectEnvs(scopeProject).find(
-      (env) => !env.versionId || env.versionId === versionId,
-    );
+    const environment = projectEnvs(scopeProject)[0];
     if (environment) void requestPreview(versionId, environment.id);
   };
   const choosePreviewEnvironment = (environmentId: string) => {
@@ -5646,13 +5659,23 @@ function ImportWorkspace({
       (preview.summary.removed ?? 0);
     askConfirm({
       title:
-        locale === "zh" ? "确认应用这份结构差异？" : "Apply this schema diff?",
+        locale === "zh"
+          ? importMode==="snapshot"?"保存这份环境快照？":importMode==="change"?"登记这份变更计划？":"登记这份已执行 SQL？"
+          : importMode==="snapshot"?"Save this environment snapshot?":importMode==="change"?"Register this change plan?":"Record this executed SQL?",
       description:
         locale === "zh"
-          ? `将新增 ${preview.summary.added ?? 0}、修改 ${preview.summary.modified ?? 0}、移除 ${preview.summary.removed ?? 0} 个字段登记。`
-          : `This adds ${preview.summary.added ?? 0}, modifies ${preview.summary.modified ?? 0}, and removes ${preview.summary.removed ?? 0} field registrations.`,
+          ? importMode==="snapshot"
+            ? `只更新所选环境的实际快照：新增 ${preview.summary.added ?? 0}、变化 ${preview.summary.modified ?? 0}、缺少 ${preview.summary.removed ?? 0}。不会进入发布。`
+            : importMode==="change"
+              ? `登记 ${changed} 项待发布变化，不修改任何环境的实际结构。`
+              : `把 ${changed} 项变化记录为已在所选环境执行，后续可用快照验证。`
+          : importMode==="snapshot"
+            ? `Update only the selected environment snapshot: ${preview.summary.added ?? 0} added, ${preview.summary.modified ?? 0} changed, ${preview.summary.removed ?? 0} missing. Nothing is released.`
+            : importMode==="change"
+              ? `Register ${changed} planned changes without altering observed structure.`
+              : `Record ${changed} changes as executed; a later snapshot can verify them.`,
       confirmLabel:
-        locale === "zh" ? `应用 ${changed} 项变化` : `Apply ${changed} changes`,
+        locale === "zh" ? importMode==="snapshot"?"保存快照":importMode==="change"?"登记计划":"登记已执行" : importMode==="snapshot"?"Save snapshot":importMode==="change"?"Register plan":"Record execution",
       run: async () => {
         setPreviewOpen(false);
         await runImport();
@@ -5674,6 +5697,26 @@ function ImportWorkspace({
           </p>
         </div>
         <CardContent className="space-y-4 p-5">
+          <div className="grid grid-cols-3 gap-1 rounded-xl bg-muted/55 p-1">
+            {([
+              ["snapshot", locale === "zh" ? "采集快照" : "Capture", locale === "zh" ? "记录一个环境当前实际结构" : "Observe one environment"],
+              ["change", locale === "zh" ? "变更计划" : "Plan", locale === "zh" ? "登记待发布 SQL，不改现状" : "Register SQL without applying"],
+              ["executed", locale === "zh" ? "已执行记录" : "Executed", locale === "zh" ? "补记已在所选环境执行的 SQL" : "Record SQL already executed"],
+            ] as const).map(([value,label,description])=>(
+              <button
+                key={value}
+                type="button"
+                onClick={()=>{
+                  setImportMode(value);
+                  if(value==="snapshot"&&scopeEnvs.length>1)setScopeEnvs(scopeEnvs.slice(0,1));
+                }}
+                className={`min-w-0 rounded-lg px-3 py-2 text-left transition-colors ${importMode===value?"bg-background shadow-sm ring-1 ring-border":"text-muted-foreground hover:text-foreground"}`}
+              >
+                <strong className="block truncate text-[11px] font-medium">{label}</strong>
+                <span className="mt-0.5 hidden truncate text-[9px] text-muted-foreground sm:block">{description}</span>
+              </button>
+            ))}
+          </div>
           <Field label={locale === "zh" ? "变更名称" : "Change name"}>
             <Input
               value={importName}
@@ -5704,7 +5747,11 @@ function ImportWorkspace({
             <Field label={t.targetVersion}>
               <SelectField
                 value={scopeVersion}
-                onValueChange={setScopeVersion}
+                onValueChange={(versionId)=>{
+                  setScopeVersion(versionId);
+                  const ids=projectEnvs(scopeProject).map((env)=>env.id);
+                  setScopeEnvs(importMode==="snapshot"?ids.slice(0,1):ids);
+                }}
                 disabled={!scopeProject}
               >
                 <option value="">
@@ -5717,13 +5764,15 @@ function ImportWorkspace({
                 ))}
               </SelectField>
             </Field>
-            <Field label={t.targetEnvs}>
-              <ScopePicker
-                envs={projectEnvs(scopeProject)}
-                selected={scopeEnvs}
-                onChange={setScopeEnvs}
-                t={t}
-              />
+            <Field label={importMode==="snapshot"?(locale === "zh" ? "采集环境" : "Environment"):t.targetEnvs}>
+              {importMode==="snapshot" ? (
+                <SelectField value={scopeEnvs[0]??""} onValueChange={(value)=>setScopeEnvs(value?[value]:[])} disabled={!scopeProject}>
+                  <option value="">{locale === "zh" ? "选择一个环境" : "Choose one environment"}</option>
+                  {projectEnvs(scopeProject).map((env)=><option key={env.id} value={env.id}>{env.name}</option>)}
+                </SelectField>
+              ) : (
+                <ScopePicker envs={projectEnvs(scopeProject)} selected={scopeEnvs} onChange={setScopeEnvs} t={t} />
+              )}
             </Field>
           </div>
           <div className="rounded-xl border bg-muted/15 p-3">
@@ -5792,7 +5841,16 @@ function ImportWorkspace({
           <div className="relative">
             <Textarea
               value={importSql}
-              onChange={(event) => setImportSql(event.target.value)}
+              onChange={(event) => {
+                const next=event.target.value;
+                setImportSql(next);
+                if(!next.trim())return;
+                if(/\bALTER\s+TABLE\b/i.test(next)&&importMode==="snapshot")setImportMode("executed");
+                else if(/\bCREATE\s+TABLE\b/i.test(next)&&!/\bALTER\s+TABLE\b/i.test(next)&&importMode!=="snapshot"){
+                  setImportMode("snapshot");
+                  if(scopeEnvs.length>1)setScopeEnvs(scopeEnvs.slice(0,1));
+                }
+              }}
               className="min-h-80 resize-y rounded-xl bg-muted/25 p-4 font-mono text-xs leading-5"
               placeholder="CREATE TABLE customer ( … );"
             />
@@ -5823,8 +5881,8 @@ function ImportWorkspace({
             <span className="text-[10px] text-muted-foreground">
               {ready
                 ? locale === "zh"
-                  ? "在宽弹框中选择版本和环境并查看差异"
-                  : "Choose a version and environment in the diff dialog"
+                  ? importMode==="snapshot"?"预览该环境相较上一次快照的变化":importMode==="change"?"预览后登记为待发布变更，不修改环境现状":"预览并补记所选环境已经执行的变化"
+                  : importMode==="snapshot"?"Preview changes since the previous snapshot":importMode==="change"?"Register as a release plan without changing current state":"Record changes already executed in selected environments"
                 : locale === "zh"
                   ? "请完成项目、版本、环境和 SQL"
                   : "Project, version, environment, and SQL are required"}
@@ -5837,7 +5895,7 @@ function ImportWorkspace({
               {busy || previewing
                 ? "…"
                 : locale === "zh"
-                  ? "查看差异"
+                  ? importMode==="change"?"预览计划":"查看差异"
                   : "View diff"}
             </Button>
           </div>
@@ -5866,6 +5924,9 @@ function ImportWorkspace({
                   <strong className="min-w-0 flex-1 truncate text-xs">
                     {batch.name}
                   </strong>
+                  <Badge variant="outline" className="text-[9px]">
+                    {batch.importMode==="change"?(locale === "zh"?"计划":"Plan"):batch.importMode==="executed"?(locale === "zh"?"已执行":"Executed"):(locale === "zh"?"快照":"Snapshot")}
+                  </Badge>
                   <ArrowRight className="size-3.5 text-muted-foreground" />
                 </div>
                 <span className="mt-1 block truncate text-[10px] text-muted-foreground">
@@ -5934,9 +5995,7 @@ function ImportWorkspace({
         previewing={previewing}
         locale={locale}
         versions={projectVersions(scopeProject)}
-        environments={projectEnvs(scopeProject).filter(
-          (env) => !env.versionId || env.versionId === previewTarget.versionId,
-        )}
+        environments={projectEnvs(scopeProject)}
         versionId={previewTarget.versionId}
         environmentId={previewTarget.environmentId}
         onVersionChange={choosePreviewVersion}
@@ -6403,12 +6462,14 @@ function ImportPreviewDialog({
           <div className="flex flex-col gap-5 pr-8 lg:flex-row lg:items-center">
             <div className="min-w-0 flex-1">
               <DialogTitle className="text-base font-semibold">
-                {locale === "zh" ? "导入前预览" : "Import preview"}
+                {locale === "zh"
+                  ? preview?.importMode==="snapshot"?"环境快照预览":preview?.importMode==="change"?"变更计划预览":"已执行记录预览"
+                  : preview?.importMode==="snapshot"?"Environment snapshot":preview?.importMode==="change"?"Change plan":"Executed SQL"}
               </DialogTitle>
               <DialogDescription className="mt-1 text-xs">
                 {locale === "zh"
-                  ? "SQL 结构与目标版本、环境之间的字段差异"
-                  : "Field differences between the SQL and target version and environment"}
+                  ? preview?.importMode==="snapshot"?"保存该环境此刻的真实结构，不会产生待发布任务":preview?.importMode==="change"?"只登记待发布 SQL，不修改当前环境结构":"记录已经执行的 SQL，等待后续快照验证"
+                  : preview?.importMode==="snapshot"?"Capture observed structure without creating release work":preview?.importMode==="change"?"Register SQL without changing observed structure":"Record executed SQL for later snapshot verification"}
               </DialogDescription>
             </div>
             <div className="grid min-w-0 gap-3 rounded-xl border bg-muted/15 p-3 sm:grid-cols-2 lg:w-[540px]">
@@ -6470,7 +6531,7 @@ function ImportPreviewDialog({
             disabled={!preview || previewing}
             onClick={onConfirm}
           >
-            {locale === "zh" ? "确认导入" : "Confirm import"}
+            {locale === "zh" ? preview?.importMode==="snapshot"?"保存快照":preview?.importMode==="change"?"登记计划":"登记已执行" : preview?.importMode==="snapshot"?"Save snapshot":preview?.importMode==="change"?"Register plan":"Record execution"}
           </Button>
         </div>
       </DialogContent>
@@ -6690,12 +6751,12 @@ function ScopeCompareDialog({
   const [historyError, setHistoryError] = useState("");
   const projectVersions = (projectId: string) =>
     versions.filter((version) => version.projectId === projectId);
-  const scopeEnvironments = (projectId: string, versionId: string) =>
-    environments.filter(
-      (environment) =>
-        environment.projectId === projectId &&
-        (!environment.versionId || environment.versionId === versionId),
+  const scopeEnvironments = (projectId: string, versionId: string) => {
+    void versionId;
+    return environments.filter(
+      (environment) => environment.projectId === projectId,
     );
+  };
   const makeTarget = (projectId: string, preferredVersion = "") => {
     const versionId = projectVersions(projectId).some(
       (version) => version.id === preferredVersion,
@@ -6726,9 +6787,7 @@ function ScopeCompareDialog({
           versionId,
           environmentId:
             environments.find(
-              (environment) =>
-                environment.projectId === project.id &&
-                (!environment.versionId || environment.versionId === versionId),
+              (environment) => environment.projectId === project.id,
             )?.id ?? "",
         };
       };
@@ -6738,7 +6797,6 @@ function ScopeCompareDialog({
       const alternate = environments.find(
         (environment) =>
           environment.projectId === project.id &&
-          (!environment.versionId || environment.versionId === rightVersion) &&
           environment.id !== left.environmentId,
       );
       if (alternate) right.environmentId = alternate.id;
@@ -7089,13 +7147,13 @@ function ReleaseWorkspace({
     statusFilter === "all" || Number(item.pendingCount) > 0,
   );
   const grouped = Array.from(filtered.reduce((groups, item) => {
-    const key = `${item.projectId}|${item.versionId}|${item.tableName}`;
-    const current = groups.get(key) ?? { key, projectName: item.projectName, versionName: item.versionName, tableName: item.tableName, changes: [] as typeof filtered };
+    const key = item.importBatchId || item.id;
+    const current = groups.get(key) ?? { key, projectName: item.projectName, versionName: item.versionName, name: item.batchName || item.name, changes: [] as typeof filtered };
     current.changes.push(item);
     groups.set(key, current);
     return groups;
   }, new Map<string, ReleaseGroup>()).values())
-    .filter((group) => `${group.projectName} ${group.versionName} ${group.tableName} ${group.changes.map((item) => `${item.fieldName} ${item.code}`).join(" ")}`.toLowerCase().includes(filter.trim().toLowerCase()))
+    .filter((group) => `${group.projectName} ${group.versionName} ${group.name} ${group.changes.map((item) => `${item.tableName} ${item.fieldName} ${item.code}`).join(" ")}`.toLowerCase().includes(filter.trim().toLowerCase()))
     .sort((left, right) => right.changes.reduce((sum, item) => sum + Number(item.pendingCount), 0) - left.changes.reduce((sum, item) => sum + Number(item.pendingCount), 0));
   const visibleGroups = grouped.slice(0, visibleLimit);
   const setStatus = async (
@@ -7109,6 +7167,23 @@ function ReleaseWorkspace({
       await load();
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error));
+    }
+  };
+  const openGroup = async (group: ReleaseGroup) => {
+    setSelectedGroup(group);
+    const batchId=group.changes[0]?.importBatchId;
+    const total=Math.max(...group.changes.map((change)=>Number(change.batchTotal)||1));
+    if(!batchId||group.changes.length>=total)return;
+    try {
+      const params=new URLSearchParams({mode:"release",batchId,limit:"5000"});
+      if(projectId)params.set("projectId",projectId);
+      if(lifecycleFilter!=="all")params.set("lifecycleStatus",lifecycleFilter);
+      const response=await fetch(`/api/catalog?${params}`);
+      if(!response.ok)throw new Error("release detail");
+      const detail=await response.json() as ReleaseInsight;
+      setSelectedGroup((current)=>current?.key===group.key?{...current,changes:detail.changes}:current);
+    } catch {
+      toast(locale==="zh"?"完整变更包加载失败":"Failed to load the complete change package");
     }
   };
   const statusLabel = (status: string) =>
@@ -7197,7 +7272,7 @@ function ReleaseWorkspace({
         ) : visibleGroups.length ? (
           <CardContent className="divide-y p-0">
             <div className="sticky top-0 z-10 flex items-center justify-between border-b bg-background/95 px-4 py-2 text-[10px] text-muted-foreground backdrop-blur-sm">
-              <span>{locale === "zh" ? `找到 ${grouped.length} 张表` : `${grouped.length} tables found`}</span>
+              <span>{locale === "zh" ? `找到 ${grouped.length} 个变更包` : `${grouped.length} change packages found`}</span>
               <span>{locale === "zh" ? `已加载 ${visibleGroups.length}` : `${visibleGroups.length} loaded`}</span>
             </div>
             {visibleGroups.map((group) => {
@@ -7205,11 +7280,11 @@ function ReleaseWorkspace({
               const pendingNames = Array.from(new Set(group.changes.flatMap((item) => (item.pendingEnvironments ?? "").split("|||").filter(Boolean))));
               return (
                 <div key={group.key} className="px-4 py-3 transition-colors hover:bg-muted/30">
-                  <button type="button" className="flex w-full items-center gap-3 text-left" onClick={() => setSelectedGroup(group)}>
+                  <button type="button" className="flex w-full items-center gap-3 text-left" onClick={() => void openGroup(group)}>
                     <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted"><FileCode2 className="size-3.5" /></span>
                     <span className="min-w-0 flex-1">
-                      <strong className="block truncate text-xs">{group.tableName}</strong>
-                      <span className="mt-1 flex items-center gap-2 truncate text-[10px] text-muted-foreground"><span className="truncate">{group.projectName} · {group.versionName} · {group.changes.length} {locale === "zh" ? "个字段" : "fields"}</span>{group.changes[0]?.lifecycleStatus !== "active" && <Badge variant="outline" className="shrink-0 text-[9px]">{group.changes[0]?.lifecycleStatus === "deprecated" ? (locale === "zh" ? "废弃" : "Deprecated") : (locale === "zh" ? "已移除" : "Removed")}</Badge>}</span>
+                      <strong className="block truncate text-xs">{group.name}</strong>
+                      <span className="mt-1 flex items-center gap-2 truncate text-[10px] text-muted-foreground"><span className="truncate">{group.projectName} · {group.versionName} · {Math.max(...group.changes.map((change)=>Number(change.batchTotal)||1))} {locale === "zh" ? "项变更" : "changes"}</span>{group.changes[0]?.lifecycleStatus !== "active" && <Badge variant="outline" className="shrink-0 text-[9px]">{group.changes[0]?.lifecycleStatus === "deprecated" ? (locale === "zh" ? "废弃" : "Deprecated") : (locale === "zh" ? "已移除" : "Removed")}</Badge>}</span>
                     </span>
                     <span className="hidden max-w-[38%] truncate text-[10px] text-muted-foreground sm:block">{groupPending ? `${locale === "zh" ? "待处理：" : "Pending: "}${pendingNames.slice(0, 2).join("、")}${pendingNames.length > 2 ? ` +${pendingNames.length - 2}` : ""}` : locale === "zh" ? "已完成" : "Complete"}</span>
                     <Badge variant={groupPending ? "secondary" : "outline"}>{groupPending ? `${locale === "zh" ? "待处理 " : "Pending "}${groupPending}` : locale === "zh" ? "已完成" : "Complete"}</Badge>
@@ -7221,7 +7296,7 @@ function ReleaseWorkspace({
             {grouped.length > visibleGroups.length && (
               <div className="flex justify-center border-t p-3">
                 <Button type="button" variant="ghost" size="sm" onClick={() => setVisibleLimit((value) => value + 40)}>
-                  {locale === "zh" ? `继续加载（还有 ${grouped.length - visibleGroups.length} 张表）` : `Load more (${grouped.length - visibleGroups.length} tables)`}
+                  {locale === "zh" ? `继续加载（还有 ${grouped.length - visibleGroups.length} 个变更包）` : `Load more (${grouped.length - visibleGroups.length} packages)`}
                 </Button>
               </div>
             )}
@@ -7273,6 +7348,8 @@ function ReleaseGroupDetail({
   statusLabel: (status: string) => string;
   onStatus: (changeId: string, environmentId: string, status: string) => Promise<void>;
 }) {
+  const [query, setQuery] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(60);
   const environments = Array.from(
     group.changes.reduce((result, change) => {
       const ids = (change.environmentIds ?? "").split("|||").filter(Boolean);
@@ -7304,38 +7381,50 @@ function ReleaseGroupDetail({
           : status === "waived"
             ? "bg-muted-foreground/50"
             : "bg-amber-500";
+  const filteredChanges = group.changes.filter((change) =>
+    `${change.tableName}.${change.fieldName} ${change.code} ${change.action}`
+      .toLowerCase()
+      .includes(query.trim().toLowerCase()),
+  );
+  const visibleChanges = filteredChanges.slice(0, visibleLimit);
   return (
     <>
       <SheetHeader className="px-5 py-4 pr-14">
         <div className="flex items-center gap-3">
           <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted"><FileCode2 className="size-3.5" /></span>
           <div className="min-w-0 flex-1">
-            <SheetTitle className="font-mono text-sm">{group.tableName}</SheetTitle>
+            <SheetTitle className="text-sm">{group.name}</SheetTitle>
             <SheetDescription>{group.projectName} · {group.versionName}</SheetDescription>
           </div>
-          <Badge variant="secondary" className="shrink-0 text-[10px]">{group.changes.length} {locale === "zh" ? "字段" : "fields"}</Badge>
+          <Badge variant="secondary" className="shrink-0 text-[10px]">{group.changes.length} {locale === "zh" ? "项" : "changes"}</Badge>
         </div>
       </SheetHeader>
       <div className="min-h-0 flex-1 overflow-auto overscroll-contain px-5 py-4 [scrollbar-gutter:stable]">
-        <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-muted-foreground">
-          <span>{locale === "zh" ? "按环境记录执行状态" : "Execution status by environment"}</span>
-          <span className="inline-flex items-center gap-1"><span className="size-1.5 rounded-full bg-amber-500" />{statusLabel("pending")}</span>
-          <span className="inline-flex items-center gap-1"><span className="size-1.5 rounded-full bg-emerald-500" />{statusLabel("verified")}</span>
+        <div className="mb-3 grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input value={query} onChange={(event) => { setQuery(event.target.value); setVisibleLimit(60); }} className="h-9 rounded-lg border-0 bg-muted/60 pl-9 shadow-none" placeholder={locale === "zh" ? "搜索表、字段或变更编号" : "Search table, field, or change"} />
+          </div>
+          <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+            <span>{locale === "zh" ? `${filteredChanges.length} 项` : `${filteredChanges.length} changes`}</span>
+            <span className="inline-flex items-center gap-1"><span className="size-1.5 rounded-full bg-amber-500" />{statusLabel("pending")}</span>
+            <span className="inline-flex items-center gap-1"><span className="size-1.5 rounded-full bg-emerald-500" />{statusLabel("verified")}</span>
+          </div>
         </div>
         <div className="min-w-[680px] overflow-hidden rounded-xl border bg-background">
           <div className="grid border-b bg-muted/35 px-3 py-2 text-[10px] font-medium text-muted-foreground" style={{ gridTemplateColumns: columns }}>
-            <span>{locale === "zh" ? "字段变更" : "Field change"}</span>
+            <span>{locale === "zh" ? "结构变更" : "Schema change"}</span>
             {environments.map((environment) => <span key={environment.id} className="truncate px-2" title={environment.name}>{environment.name}</span>)}
           </div>
           <div className="divide-y">
-          {group.changes.map((change) => {
+          {visibleChanges.map((change) => {
             const ids = (change.environmentIds ?? "").split("|||").filter(Boolean);
             const statuses = (change.environmentStatuses ?? "").split("|||");
             const statusByEnvironment = new Map(ids.map((id, index) => [id, statuses[index] ?? "pending"]));
             return (
               <section key={change.id} className="grid items-center px-3 py-3" style={{ gridTemplateColumns: columns }}>
                 <div className="min-w-0 pr-3">
-                  <div className="flex items-center gap-2"><strong className="truncate text-xs">{change.fieldName}</strong><Badge variant="outline" className="shrink-0 text-[9px]">{change.action.toUpperCase()}</Badge></div>
+                  <div className="flex items-center gap-2"><strong className="truncate text-xs">{change.tableName}.{change.fieldName}</strong><Badge variant="outline" className="shrink-0 text-[9px]">{change.action.toUpperCase()}</Badge></div>
                   <code className="mt-1 block truncate text-[10px] text-muted-foreground">{change.code}</code>
                 </div>
                 {environments.map((environment) => {
@@ -7355,6 +7444,13 @@ function ReleaseGroupDetail({
           })}
           </div>
         </div>
+        {filteredChanges.length > visibleChanges.length && (
+          <div className="flex justify-center py-3">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setVisibleLimit((value) => value + 60)}>
+              {locale === "zh" ? `继续加载（还有 ${filteredChanges.length - visibleChanges.length} 项）` : `Load more (${filteredChanges.length - visibleChanges.length})`}
+            </Button>
+          </div>
+        )}
       </div>
     </>
   );
