@@ -1,27 +1,27 @@
-"use client"
+"use client";
 
-import * as React from "react"
-import { Dialog as DialogPrimitive } from "radix-ui"
-import { X } from "lucide-react"
+import * as React from "react";
+import { Dialog as DialogPrimitive } from "radix-ui";
+import { X } from "lucide-react";
 
-import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 
-type SheetSize = "default" | "detail"
+type SheetSize = "default" | "detail";
 
 const sheetSizeClass: Record<SheetSize, string> = {
   default: "max-w-xl",
   detail: "max-w-[720px]",
-}
+};
 
 function Sheet(props: React.ComponentProps<typeof DialogPrimitive.Root>) {
-  return <DialogPrimitive.Root data-slot="sheet" {...props} />
+  return <DialogPrimitive.Root data-slot="sheet" {...props} />;
 }
 
 function SheetPortal(
-  props: React.ComponentProps<typeof DialogPrimitive.Portal>
+  props: React.ComponentProps<typeof DialogPrimitive.Portal>,
 ) {
-  return <DialogPrimitive.Portal data-slot="sheet-portal" {...props} />
+  return <DialogPrimitive.Portal data-slot="sheet-portal" {...props} />;
 }
 
 function SheetOverlay({
@@ -33,11 +33,11 @@ function SheetOverlay({
       data-slot="sheet-overlay"
       className={cn(
         "fixed inset-0 z-50 bg-black/15 backdrop-blur-[2px] duration-200 data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
-        className
+        className,
       )}
       {...props}
     />
-  )
+  );
 }
 
 function SheetContent({
@@ -46,7 +46,7 @@ function SheetContent({
   size = "default",
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
-  size?: SheetSize
+  size?: SheetSize;
 }) {
   return (
     <SheetPortal>
@@ -56,7 +56,7 @@ function SheetContent({
         className={cn(
           "fixed inset-y-0 right-0 z-50 flex h-dvh min-h-0 w-full flex-col overflow-hidden border-l bg-background shadow-2xl duration-200 outline-none data-open:animate-in data-open:slide-in-from-right data-closed:animate-out data-closed:slide-out-to-right",
           sheetSizeClass[size],
-          className
+          className,
         )}
         {...props}
       >
@@ -74,7 +74,7 @@ function SheetContent({
         </DialogPrimitive.Close>
       </DialogPrimitive.Content>
     </SheetPortal>
-  )
+  );
 }
 
 function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
@@ -84,7 +84,7 @@ function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
       className={cn("shrink-0 border-b px-6 py-5 pr-14", className)}
       {...props}
     />
-  )
+  );
 }
 
 function SheetTitle({
@@ -97,7 +97,7 @@ function SheetTitle({
       className={cn("text-sm font-semibold", className)}
       {...props}
     />
-  )
+  );
 }
 
 function SheetDescription({
@@ -110,7 +110,7 @@ function SheetDescription({
       className={cn("mt-1 text-xs leading-5 text-muted-foreground", className)}
       {...props}
     />
-  )
+  );
 }
 
-export { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle }
+export { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle };

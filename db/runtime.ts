@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:workers';
+import { env } from "cloudflare:workers";
 
 const statements = [
   `CREATE TABLE IF NOT EXISTS runtime_meta (key text PRIMARY KEY NOT NULL, value text NOT NULL)`,
@@ -65,9 +65,12 @@ const seeds = [
   `INSERT OR IGNORE INTO projects VALUES ('project-a','A','Project A','2.3.0','current','2026-08-01T00:00:00Z')`,
   `INSERT OR IGNORE INTO projects VALUES ('project-b','B','Project B','2.3.0','current','2026-08-01T00:00:00Z')`,
   `INSERT OR IGNORE INTO projects VALUES ('project-c','C','Project C','2.2.0','upgrade','2026-08-01T00:00:00Z')`,
-  `INSERT OR IGNORE INTO project_modules VALUES ('project-a','mod-core','2.3.0')`, `INSERT OR IGNORE INTO project_modules VALUES ('project-a','mod-level','1.0.0')`,
-  `INSERT OR IGNORE INTO project_modules VALUES ('project-b','mod-core','2.3.0')`, `INSERT OR IGNORE INTO project_modules VALUES ('project-b','mod-level','1.0.0')`,
-  `INSERT OR IGNORE INTO project_modules VALUES ('project-b','mod-region','1.0.0')`, `INSERT OR IGNORE INTO project_modules VALUES ('project-c','mod-core','2.2.0')`,
+  `INSERT OR IGNORE INTO project_modules VALUES ('project-a','mod-core','2.3.0')`,
+  `INSERT OR IGNORE INTO project_modules VALUES ('project-a','mod-level','1.0.0')`,
+  `INSERT OR IGNORE INTO project_modules VALUES ('project-b','mod-core','2.3.0')`,
+  `INSERT OR IGNORE INTO project_modules VALUES ('project-b','mod-level','1.0.0')`,
+  `INSERT OR IGNORE INTO project_modules VALUES ('project-b','mod-region','1.0.0')`,
+  `INSERT OR IGNORE INTO project_modules VALUES ('project-c','mod-core','2.2.0')`,
   `INSERT OR IGNORE INTO project_modules VALUES ('project-c','mod-channel','1.0.0')`,
   `INSERT OR IGNORE INTO schema_fields VALUES ('field-001','CUS-001','customer','id','integer','Customer primary identifier','mod-core','1.0.0','2.3.0','2026-08-01T00:00:00Z')`,
   `INSERT OR IGNORE INTO schema_fields VALUES ('field-002','CUS-002','customer','name','varchar(120)','Customer display name','mod-core','1.0.0','2.3.0','2026-08-01T00:00:00Z')`,
@@ -95,91 +98,331 @@ const seeds = [
   `INSERT OR IGNORE INTO catalog_environments VALUES ('cat-env-b-prod','cat-project-b','cat-version-b','prod','正式环境','production',30,0,'2026-08-01T00:00:00Z')`,
 ];
 
-export function getD1() { if (!env.DB) throw new Error('Cloudflare D1 binding `DB` is unavailable.'); return env.DB; }
+export function getD1() {
+  if (!env.DB) throw new Error("Cloudflare D1 binding `DB` is unavailable.");
+  return env.DB;
+}
 export async function ensureDatabase() {
   const db = getD1();
   await db.batch(statements.map((sql) => db.prepare(sql)));
-  const [projectColumns,versionColumns,importColumns,importItemColumns,changeColumns,tableColumns,fieldColumns,indexColumns,constraintColumns,fieldScopeRevisionColumns] = await Promise.all([
-    db.prepare(`PRAGMA table_info(catalog_projects)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_versions)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(import_batches)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(import_items)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_changes)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_tables)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_fields)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_indexes)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_constraints)`).all<{name:string}>(),
-    db.prepare(`PRAGMA table_info(catalog_field_scope_revisions)`).all<{name:string}>(),
+  const [
+    projectColumns,
+    versionColumns,
+    importColumns,
+    importItemColumns,
+    changeColumns,
+    tableColumns,
+    fieldColumns,
+    indexColumns,
+    constraintColumns,
+    fieldScopeRevisionColumns,
+  ] = await Promise.all([
+    db.prepare(`PRAGMA table_info(catalog_projects)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(catalog_versions)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(import_batches)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(import_items)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(catalog_changes)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(catalog_tables)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(catalog_fields)`).all<{ name: string }>(),
+    db.prepare(`PRAGMA table_info(catalog_indexes)`).all<{ name: string }>(),
+    db
+      .prepare(`PRAGMA table_info(catalog_constraints)`)
+      .all<{ name: string }>(),
+    db
+      .prepare(`PRAGMA table_info(catalog_field_scope_revisions)`)
+      .all<{ name: string }>(),
   ]);
-  const alterations:D1PreparedStatement[]=[];
-  if (!projectColumns.results.some((column) => column.name === 'icon')) alterations.push(db.prepare(`ALTER TABLE catalog_projects ADD COLUMN icon text DEFAULT 'boxes' NOT NULL`));
-  if (!projectColumns.results.some((column) => column.name === 'anchor_version_id')) alterations.push(db.prepare(`ALTER TABLE catalog_projects ADD COLUMN anchor_version_id text`));
-  if (!projectColumns.results.some((column) => column.name === 'anchor_environment_id')) alterations.push(db.prepare(`ALTER TABLE catalog_projects ADD COLUMN anchor_environment_id text`));
-  if (!versionColumns.results.some((column) => column.name === 'repository_id')) alterations.push(db.prepare(`ALTER TABLE catalog_versions ADD COLUMN repository_id text`));
-  if (!versionColumns.results.some((column) => column.name === 'git_ref')) alterations.push(db.prepare(`ALTER TABLE catalog_versions ADD COLUMN git_ref text`));
-  if (!versionColumns.results.some((column) => column.name === 'git_commit')) alterations.push(db.prepare(`ALTER TABLE catalog_versions ADD COLUMN git_commit text`));
-  if (!importColumns.results.some((column) => column.name === 'raw_sql')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN raw_sql text DEFAULT '' NOT NULL`));
-  if (!importColumns.results.some((column) => column.name === 'source_path')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN source_path text`));
-  if (!importColumns.results.some((column) => column.name === 'git_commit')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN git_commit text`));
-  if (!importColumns.results.some((column) => column.name === 'modified_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN modified_count integer DEFAULT 0 NOT NULL`));
-  if (!importColumns.results.some((column) => column.name === 'removed_count')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN removed_count integer DEFAULT 0 NOT NULL`));
-  if (!importColumns.results.some((column) => column.name === 'import_mode')) alterations.push(db.prepare(`ALTER TABLE import_batches ADD COLUMN import_mode text DEFAULT 'snapshot' NOT NULL`));
-  if (!importItemColumns.results.some((column) => column.name === 'before_snapshot')) alterations.push(db.prepare(`ALTER TABLE import_items ADD COLUMN before_snapshot text`));
-  if (!changeColumns.results.some((column) => column.name === 'import_batch_id')) alterations.push(db.prepare(`ALTER TABLE catalog_changes ADD COLUMN import_batch_id text`));
-  if (!tableColumns.results.some((column) => column.name === 'lifecycle_status')) alterations.push(db.prepare(`ALTER TABLE catalog_tables ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`));
-  if (!tableColumns.results.some((column) => column.name === 'lifecycle_note')) alterations.push(db.prepare(`ALTER TABLE catalog_tables ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`));
-  if (!fieldColumns.results.some((column) => column.name === 'lifecycle_status')) alterations.push(db.prepare(`ALTER TABLE catalog_fields ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`));
-  if (!fieldColumns.results.some((column) => column.name === 'lifecycle_note')) alterations.push(db.prepare(`ALTER TABLE catalog_fields ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`));
-  if (!indexColumns.results.some((column) => column.name === 'lifecycle_status')) alterations.push(db.prepare(`ALTER TABLE catalog_indexes ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`));
-  if (!indexColumns.results.some((column) => column.name === 'lifecycle_note')) alterations.push(db.prepare(`ALTER TABLE catalog_indexes ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`));
-  if (!constraintColumns.results.some((column) => column.name === 'lifecycle_status')) alterations.push(db.prepare(`ALTER TABLE catalog_constraints ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`));
-  if (!constraintColumns.results.some((column) => column.name === 'lifecycle_note')) alterations.push(db.prepare(`ALTER TABLE catalog_constraints ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`));
-  if (!fieldScopeRevisionColumns.results.some((column) => column.name === 'resolution_kind')) alterations.push(db.prepare(`ALTER TABLE catalog_field_scope_revisions ADD COLUMN resolution_kind text DEFAULT 'same' NOT NULL`));
-  if (!fieldScopeRevisionColumns.results.some((column) => column.name === 'review_status')) alterations.push(db.prepare(`ALTER TABLE catalog_field_scope_revisions ADD COLUMN review_status text DEFAULT 'confirmed' NOT NULL`));
-  if (!fieldScopeRevisionColumns.results.some((column) => column.name === 'resolution_note')) alterations.push(db.prepare(`ALTER TABLE catalog_field_scope_revisions ADD COLUMN resolution_note text DEFAULT '' NOT NULL`));
-  if (!fieldScopeRevisionColumns.results.some((column) => column.name === 'import_item_id')) alterations.push(db.prepare(`ALTER TABLE catalog_field_scope_revisions ADD COLUMN import_item_id text`));
+  const alterations: D1PreparedStatement[] = [];
+  if (!projectColumns.results.some((column) => column.name === "icon"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_projects ADD COLUMN icon text DEFAULT 'boxes' NOT NULL`,
+      ),
+    );
+  if (
+    !projectColumns.results.some(
+      (column) => column.name === "anchor_version_id",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_projects ADD COLUMN anchor_version_id text`,
+      ),
+    );
+  if (
+    !projectColumns.results.some(
+      (column) => column.name === "anchor_environment_id",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_projects ADD COLUMN anchor_environment_id text`,
+      ),
+    );
+  if (!versionColumns.results.some((column) => column.name === "repository_id"))
+    alterations.push(
+      db.prepare(`ALTER TABLE catalog_versions ADD COLUMN repository_id text`),
+    );
+  if (!versionColumns.results.some((column) => column.name === "git_ref"))
+    alterations.push(
+      db.prepare(`ALTER TABLE catalog_versions ADD COLUMN git_ref text`),
+    );
+  if (!versionColumns.results.some((column) => column.name === "git_commit"))
+    alterations.push(
+      db.prepare(`ALTER TABLE catalog_versions ADD COLUMN git_commit text`),
+    );
+  if (!importColumns.results.some((column) => column.name === "raw_sql"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE import_batches ADD COLUMN raw_sql text DEFAULT '' NOT NULL`,
+      ),
+    );
+  if (!importColumns.results.some((column) => column.name === "source_path"))
+    alterations.push(
+      db.prepare(`ALTER TABLE import_batches ADD COLUMN source_path text`),
+    );
+  if (!importColumns.results.some((column) => column.name === "git_commit"))
+    alterations.push(
+      db.prepare(`ALTER TABLE import_batches ADD COLUMN git_commit text`),
+    );
+  if (!importColumns.results.some((column) => column.name === "modified_count"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE import_batches ADD COLUMN modified_count integer DEFAULT 0 NOT NULL`,
+      ),
+    );
+  if (!importColumns.results.some((column) => column.name === "removed_count"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE import_batches ADD COLUMN removed_count integer DEFAULT 0 NOT NULL`,
+      ),
+    );
+  if (!importColumns.results.some((column) => column.name === "import_mode"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE import_batches ADD COLUMN import_mode text DEFAULT 'snapshot' NOT NULL`,
+      ),
+    );
+  if (
+    !importItemColumns.results.some(
+      (column) => column.name === "before_snapshot",
+    )
+  )
+    alterations.push(
+      db.prepare(`ALTER TABLE import_items ADD COLUMN before_snapshot text`),
+    );
+  if (
+    !changeColumns.results.some((column) => column.name === "import_batch_id")
+  )
+    alterations.push(
+      db.prepare(`ALTER TABLE catalog_changes ADD COLUMN import_batch_id text`),
+    );
+  if (
+    !tableColumns.results.some((column) => column.name === "lifecycle_status")
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_tables ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`,
+      ),
+    );
+  if (!tableColumns.results.some((column) => column.name === "lifecycle_note"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_tables ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`,
+      ),
+    );
+  if (
+    !fieldColumns.results.some((column) => column.name === "lifecycle_status")
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_fields ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`,
+      ),
+    );
+  if (!fieldColumns.results.some((column) => column.name === "lifecycle_note"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_fields ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`,
+      ),
+    );
+  if (
+    !indexColumns.results.some((column) => column.name === "lifecycle_status")
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_indexes ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`,
+      ),
+    );
+  if (!indexColumns.results.some((column) => column.name === "lifecycle_note"))
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_indexes ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`,
+      ),
+    );
+  if (
+    !constraintColumns.results.some(
+      (column) => column.name === "lifecycle_status",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_constraints ADD COLUMN lifecycle_status text DEFAULT 'active' NOT NULL`,
+      ),
+    );
+  if (
+    !constraintColumns.results.some(
+      (column) => column.name === "lifecycle_note",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_constraints ADD COLUMN lifecycle_note text DEFAULT '' NOT NULL`,
+      ),
+    );
+  if (
+    !fieldScopeRevisionColumns.results.some(
+      (column) => column.name === "resolution_kind",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_field_scope_revisions ADD COLUMN resolution_kind text DEFAULT 'same' NOT NULL`,
+      ),
+    );
+  if (
+    !fieldScopeRevisionColumns.results.some(
+      (column) => column.name === "review_status",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_field_scope_revisions ADD COLUMN review_status text DEFAULT 'confirmed' NOT NULL`,
+      ),
+    );
+  if (
+    !fieldScopeRevisionColumns.results.some(
+      (column) => column.name === "resolution_note",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_field_scope_revisions ADD COLUMN resolution_note text DEFAULT '' NOT NULL`,
+      ),
+    );
+  if (
+    !fieldScopeRevisionColumns.results.some(
+      (column) => column.name === "import_item_id",
+    )
+  )
+    alterations.push(
+      db.prepare(
+        `ALTER TABLE catalog_field_scope_revisions ADD COLUMN import_item_id text`,
+      ),
+    );
   if (alterations.length) await db.batch(alterations);
-  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_versions_repository ON catalog_versions(repository_id)`).run();
-  const importModeMarker=await db.prepare(`SELECT value FROM runtime_meta WHERE key='import_mode_backfill_v1'`).first();
-  if(!importModeMarker){await db.batch([
-    db.prepare(`UPDATE import_batches SET import_mode=CASE WHEN lower(coalesce(raw_sql,'')) LIKE '%alter table%' THEN 'executed' ELSE 'snapshot' END`),
-    db.prepare(`INSERT OR REPLACE INTO runtime_meta (key,value) VALUES ('import_mode_backfill_v1',?)`).bind(new Date().toISOString()),
-  ]);}
-  const tableScopeMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='table_scope_backfill_v1'`).first();
-  if (!tableScopeMarker) {
+  await db
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_catalog_versions_repository ON catalog_versions(repository_id)`,
+    )
+    .run();
+  const importModeMarker = await db
+    .prepare(
+      `SELECT value FROM runtime_meta WHERE key='import_mode_backfill_v1'`,
+    )
+    .first();
+  if (!importModeMarker) {
     await db.batch([
-      db.prepare(`INSERT OR IGNORE INTO table_scopes (table_id,project_id,version_id,environment_id,state,origin,import_batch_id,created_at) SELECT DISTINCT f.table_id,fs.project_id,fs.version_id,fs.environment_id,fs.state,fs.origin,fs.import_batch_id,fs.created_at FROM field_scopes fs JOIN catalog_fields f ON f.id=fs.field_id`),
-      db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('table_scope_backfill_v1','1')`),
+      db.prepare(
+        `UPDATE import_batches SET import_mode=CASE WHEN lower(coalesce(raw_sql,'')) LIKE '%alter table%' THEN 'executed' ELSE 'snapshot' END`,
+      ),
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO runtime_meta (key,value) VALUES ('import_mode_backfill_v1',?)`,
+        )
+        .bind(new Date().toISOString()),
     ]);
   }
-  const lifecycleMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='project_lifecycle_backfill_v1'`).first();
-  if (!lifecycleMarker) {
-    const updatedAt=new Date().toISOString();
+  const tableScopeMarker = await db
+    .prepare(
+      `SELECT value FROM runtime_meta WHERE key='table_scope_backfill_v1'`,
+    )
+    .first();
+  if (!tableScopeMarker) {
     await db.batch([
-      db.prepare(`INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'table',t.id,s.project_id,coalesce(t.lifecycle_status,'active'),coalesce(t.lifecycle_note,''),? FROM catalog_tables t JOIN (SELECT DISTINCT table_id,project_id FROM table_scopes) s ON s.table_id=t.id`).bind(updatedAt),
-      db.prepare(`INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'field',f.id,s.project_id,coalesce(f.lifecycle_status,'active'),coalesce(f.lifecycle_note,''),? FROM catalog_fields f JOIN (SELECT DISTINCT field_id,project_id FROM field_scopes) s ON s.field_id=f.id`).bind(updatedAt),
-      db.prepare(`INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'index',i.id,s.project_id,coalesce(i.lifecycle_status,'active'),coalesce(i.lifecycle_note,''),? FROM catalog_indexes i JOIN (SELECT DISTINCT index_id,project_id FROM catalog_index_scopes) s ON s.index_id=i.id`).bind(updatedAt),
-      db.prepare(`INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'constraint',c.id,s.project_id,coalesce(c.lifecycle_status,'active'),coalesce(c.lifecycle_note,''),? FROM catalog_constraints c JOIN (SELECT DISTINCT constraint_id,project_id FROM catalog_constraint_scopes) s ON s.constraint_id=c.id`).bind(updatedAt),
-      db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('project_lifecycle_backfill_v1','1')`),
+      db.prepare(
+        `INSERT OR IGNORE INTO table_scopes (table_id,project_id,version_id,environment_id,state,origin,import_batch_id,created_at) SELECT DISTINCT f.table_id,fs.project_id,fs.version_id,fs.environment_id,fs.state,fs.origin,fs.import_batch_id,fs.created_at FROM field_scopes fs JOIN catalog_fields f ON f.id=fs.field_id`,
+      ),
+      db.prepare(
+        `INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('table_scope_backfill_v1','1')`,
+      ),
+    ]);
+  }
+  const lifecycleMarker = await db
+    .prepare(
+      `SELECT value FROM runtime_meta WHERE key='project_lifecycle_backfill_v1'`,
+    )
+    .first();
+  if (!lifecycleMarker) {
+    const updatedAt = new Date().toISOString();
+    await db.batch([
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'table',t.id,s.project_id,coalesce(t.lifecycle_status,'active'),coalesce(t.lifecycle_note,''),? FROM catalog_tables t JOIN (SELECT DISTINCT table_id,project_id FROM table_scopes) s ON s.table_id=t.id`,
+        )
+        .bind(updatedAt),
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'field',f.id,s.project_id,coalesce(f.lifecycle_status,'active'),coalesce(f.lifecycle_note,''),? FROM catalog_fields f JOIN (SELECT DISTINCT field_id,project_id FROM field_scopes) s ON s.field_id=f.id`,
+        )
+        .bind(updatedAt),
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'index',i.id,s.project_id,coalesce(i.lifecycle_status,'active'),coalesce(i.lifecycle_note,''),? FROM catalog_indexes i JOIN (SELECT DISTINCT index_id,project_id FROM catalog_index_scopes) s ON s.index_id=i.id`,
+        )
+        .bind(updatedAt),
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO catalog_object_lifecycles (entity,object_id,project_id,status,note,updated_at) SELECT 'constraint',c.id,s.project_id,coalesce(c.lifecycle_status,'active'),coalesce(c.lifecycle_note,''),? FROM catalog_constraints c JOIN (SELECT DISTINCT constraint_id,project_id FROM catalog_constraint_scopes) s ON s.constraint_id=c.id`,
+        )
+        .bind(updatedAt),
+      db.prepare(
+        `INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('project_lifecycle_backfill_v1','1')`,
+      ),
     ]);
   }
   // Older builds registered pure CREATE snapshots as pending rollout work.
   // A snapshot is evidence of the structure that already exists in the selected
   // environment, not a migration that still needs to be executed elsewhere.
-  const baselineImportMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='baseline_import_cleanup_v2'`).first();
+  const baselineImportMarker = await db
+    .prepare(
+      `SELECT value FROM runtime_meta WHERE key='baseline_import_cleanup_v2'`,
+    )
+    .first();
   if (!baselineImportMarker) {
-    const verifiedAt=new Date().toISOString();
-    const baselineBatches=`SELECT b.id FROM import_batches b
+    const verifiedAt = new Date().toISOString();
+    const baselineBatches = `SELECT b.id FROM import_batches b
       WHERE lower(coalesce(b.raw_sql,'')) LIKE '%create table%'
         AND NOT EXISTS (
           SELECT 1 FROM import_items bi
           WHERE bi.batch_id=b.id AND (lower(bi.action)<>'add' OR bi.result='conflict')
         )`;
     await db.batch([
-      db.prepare(`UPDATE catalog_sql_executions SET status='verified',started_at=coalesce(started_at,?),finished_at=coalesce(finished_at,?),note='初始化快照已确认该环境结构存在。' WHERE import_batch_id IN (${baselineBatches})`).bind(verifiedAt,verifiedAt),
-      db.prepare(`DELETE FROM catalog_change_scopes WHERE change_id IN (SELECT id FROM catalog_changes WHERE import_batch_id IN (${baselineBatches}))`),
-      db.prepare(`DELETE FROM catalog_changes WHERE import_batch_id IN (${baselineBatches})`),
-      db.prepare(`INSERT OR REPLACE INTO runtime_meta (key,value) VALUES ('baseline_import_cleanup_v2',?)`).bind(verifiedAt),
+      db
+        .prepare(
+          `UPDATE catalog_sql_executions SET status='verified',started_at=coalesce(started_at,?),finished_at=coalesce(finished_at,?),note='初始化快照已确认该环境结构存在。' WHERE import_batch_id IN (${baselineBatches})`,
+        )
+        .bind(verifiedAt, verifiedAt),
+      db.prepare(
+        `DELETE FROM catalog_change_scopes WHERE change_id IN (SELECT id FROM catalog_changes WHERE import_batch_id IN (${baselineBatches}))`,
+      ),
+      db.prepare(
+        `DELETE FROM catalog_changes WHERE import_batch_id IN (${baselineBatches})`,
+      ),
+      db
+        .prepare(
+          `INSERT OR REPLACE INTO runtime_meta (key,value) VALUES ('baseline_import_cleanup_v2',?)`,
+        )
+        .bind(verifiedAt),
     ]);
   }
   // Existing catalog data predates revisioned definitions. Create a stable baseline revision
@@ -193,11 +436,15 @@ export async function ensureDatabase() {
     db.prepare(`INSERT OR IGNORE INTO catalog_field_scope_revisions (field_id,version_id,environment_id,revision_id,updated_at)
       SELECT fs.field_id,fs.version_id,fs.environment_id,fs.field_id || ':r1',fs.created_at FROM field_scopes fs`),
   ]);
-  const seedMarker = await db.prepare(`SELECT value FROM runtime_meta WHERE key='initial_seed'`).first();
+  const seedMarker = await db
+    .prepare(`SELECT value FROM runtime_meta WHERE key='initial_seed'`)
+    .first();
   if (!seedMarker) {
     await db.batch([
       ...seeds.map((sql) => db.prepare(sql)),
-      db.prepare(`INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('initial_seed','1')`),
+      db.prepare(
+        `INSERT OR IGNORE INTO runtime_meta (key,value) VALUES ('initial_seed','1')`,
+      ),
     ]);
   }
   // Run once more after first-run seeds so the seeded catalog is revisioned immediately.
