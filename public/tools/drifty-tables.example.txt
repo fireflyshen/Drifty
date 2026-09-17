@@ -1,0 +1,6 @@
+# 一行一个 MySQL 表名。允许空行和以 # 开头的注释。
+# 复制为 drifty-tables.txt 后，替换成需要采集的实际表名。
+
+customer
+customer_address
+sales_order

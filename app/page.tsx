@@ -491,14 +491,15 @@ export default function Home() {
       const warningCount = Array.isArray(result.warnings)
         ? result.warnings.length
         : 0;
+      const verifiedCount = number(result.verifiedChanges);
       toast(
         result.duplicateBatch
           ? locale === "zh"
             ? `这份 SQL 已导入 · ${result.batchCode}`
             : `Already imported · ${result.batchCode}`
           : locale === "zh"
-            ? `完成 · 新增 ${number(result.added)} · 修改 ${number(result.modified)} · 删除 ${number(result.removed)} · 重复 ${number(result.duplicates)} · 冲突 ${number(result.conflicts)}${warningCount ? ` · ${warningCount} 条提醒` : ""}`
-            : `Done · ${number(result.added)} added · ${number(result.modified)} modified · ${number(result.removed)} removed · ${number(result.duplicates)} duplicate · ${number(result.conflicts)} conflict${warningCount ? ` · ${warningCount} warnings` : ""}`,
+            ? `完成 · 新增 ${number(result.added)} · 修改 ${number(result.modified)} · 删除 ${number(result.removed)} · 重复 ${number(result.duplicates)} · 冲突 ${number(result.conflicts)}${verifiedCount ? ` · 已核验 ${verifiedCount}` : ""}${warningCount ? ` · ${warningCount} 条提醒` : ""}`
+            : `Done · ${number(result.added)} added · ${number(result.modified)} modified · ${number(result.removed)} removed · ${number(result.duplicates)} duplicate · ${number(result.conflicts)} conflict${verifiedCount ? ` · ${verifiedCount} verified` : ""}${warningCount ? ` · ${warningCount} warnings` : ""}`,
       );
       setImportName("");
       setImportSql("");

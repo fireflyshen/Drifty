@@ -247,6 +247,22 @@ export type ScopePreview = {
   targetCount: number;
   baseTablePresent?: boolean | null;
   targetTablePresent?: boolean | null;
+  alignmentSql?: string;
+  alignmentItems?: {
+    key: string;
+    action: "add" | "modify" | "drop";
+    tableName: string;
+    columnName: string;
+    before: string | null;
+    after: string | null;
+    sql: string;
+    destructive: boolean;
+  }[];
+  alignmentSummary?: {
+    added: number;
+    modified: number;
+    dropped: number;
+  };
   indexItems?: {
     name: string;
     kind: string;

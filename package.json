@@ -9,7 +9,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "node --experimental-strip-types --test app/lib/mysql-parser.test.ts",
+    "test": "node --experimental-strip-types --test app/lib/mysql-parser.test.ts server/catalog/diff/field-alignment.test.ts && python3 -m unittest scripts/test_export_mysql_schema.py",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "db:migrate:remote": "wrangler d1 migrations apply drifty --remote",

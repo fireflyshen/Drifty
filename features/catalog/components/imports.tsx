@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { SheetHeader } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import { Empty, EnvironmentSummary, Field, IconButton, ScopePicker, SelectField, formatDate, importResultLabel, words } from "@/features/catalog/presentation";
-import { ArrowLeftRight, ArrowRight, CheckCircle2, ChevronDown, Copy, FileCode2, GitBranch, GitCommitHorizontal, Import, Pencil, RotateCcw, Search, Upload } from "lucide-react";
+import { ArrowLeftRight, ArrowRight, CheckCircle2, ChevronDown, Copy, Download, FileCode2, GitBranch, GitCommitHorizontal, Import, Pencil, RotateCcw, Search, ShieldCheck, Upload } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 /**
@@ -616,6 +616,25 @@ export function ImportWorkspace({
   const [mappingPhysical, setMappingPhysical] = useState("");
   const [mappingLogical, setMappingLogical] = useState("");
   const [mappings, setMappings] = useState<{ id: string; physicalName: string; logicalName: string }[]>([]);
+  const copyReadonlyExporter = async () => {
+    try {
+      const response = await fetch("/tools/export_mysql_schema.py");
+      if (!response.ok) throw new Error(String(response.status));
+      const script = await response.text();
+      if (!navigator.clipboard)
+        throw new Error(
+          locale === "zh" ? "当前浏览器不支持复制" : "Clipboard unavailable",
+        );
+      await navigator.clipboard.writeText(script);
+      toast(locale === "zh" ? "只读导出脚本已复制" : "Read-only exporter copied");
+    } catch (error) {
+      toast(
+        locale === "zh"
+          ? `复制失败：${error instanceof Error ? error.message : String(error)}`
+          : `Copy failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
   useEffect(() => {
     if (!scopeProject) return;
     void call("table.mapping.list", { projectId: scopeProject }).then((result) => {
@@ -875,6 +894,53 @@ export function ImportWorkspace({
                 {label}
               </span>
             ))}
+          </div>
+          <div className="rounded-xl border border-dashed bg-muted/15 p-4">
+            <div className="flex items-start gap-3">
+              <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                <ShieldCheck className="size-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-semibold">
+                  {locale === "zh"
+                    ? "内网数据库只读采集"
+                    : "Read-only intranet collection"}
+                </div>
+                <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+                  {locale === "zh"
+                    ? "下载或复制独立 Python 脚本，在内网按表清单执行。脚本只允许读取 information_schema 和 SHOW CREATE TABLE，不读取业务数据。"
+                    : "Copy or download the standalone Python script and run it inside the intranet with a table list. It only allows information_schema and SHOW CREATE TABLE reads."}
+                </p>
+                <code className="mt-2 block overflow-x-auto rounded-lg bg-background px-3 py-2 text-[9px] leading-4 text-muted-foreground">
+                  python export_mysql_schema.py --database your_db --user
+                  schema_reader --tables-file drifty-tables.txt --out
+                  drifty-schema.sql
+                </code>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void copyReadonlyExporter()}
+                  >
+                    <Copy />
+                    {locale === "zh" ? "复制脚本" : "Copy script"}
+                  </Button>
+                  <Button asChild type="button" variant="outline" size="sm">
+                    <a href="/tools/export_mysql_schema.py" download>
+                      <Download />
+                      {locale === "zh" ? "下载脚本" : "Download script"}
+                    </a>
+                  </Button>
+                  <Button asChild type="button" variant="ghost" size="sm">
+                    <a href="/tools/drifty-tables.example.txt" download>
+                      <FileCode2 />
+                      {locale === "zh" ? "表清单模板" : "Table-list template"}
+                    </a>
+                  </Button>
+                </div>
+              </div>
+            </div>
           </div>
           <div className="relative">
             <Textarea

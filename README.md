@@ -54,9 +54,9 @@ npm run build
 npm run deploy:cloudflare
 ```
 
-## 批量导出 `mes_` 表结构
+## 只读导出内网 MySQL 表结构
 
-项目提供了一个只读 Python 脚本：它只查询 `information_schema` 和 `SHOW CREATE TABLE`，不会执行 `INSERT`、`UPDATE`、`DELETE` 或任何建表/改表语句。
+导入页可以直接复制或下载独立 Python 脚本及表清单模板。脚本只允许查询 `information_schema.TABLES` 和执行 `SHOW CREATE TABLE`，不会读取业务数据，也不会执行 DDL、DML、锁表或存储过程。
 
 先创建一个项目专用的 Python 虚拟环境并安装依赖（不会修改系统 Python）：
 
@@ -69,7 +69,13 @@ python -m pip install mysql-connector-python
 然后运行（密码会安全地在终端输入，不会出现在命令历史中）：
 
 ```bash
-python scripts/export_mes_schema.py --host 127.0.0.1 --port 3306 --user readonly --database your_db --out mes_schema.sql
+python public/tools/export_mysql_schema.py \
+  --host 127.0.0.1 \
+  --port 3306 \
+  --user schema_reader \
+  --database your_db \
+  --tables-file drifty-tables.txt \
+  --out drifty-schema.sql
 ```
 
-脚本默认只导出表名以 `mes_` 开头的真实数据表，并按表名排序生成一个 SQL 文件；也可以用 `--prefix` 更换前缀。建议使用只拥有元数据读取权限的 MySQL 账号。生成的 `mes_schema.sql` 可直接在 Drifty「导入」页面上传，选择目标项目、版本和环境后查看差异。
+表清单一行一个表名，可先用 `--list-only` 离线检查。建议使用专门的只读账号；脚本自身还有查询白名单，其他 SQL 会在提交给驱动前被拒绝。生成的 `drifty-schema.sql` 可带回并在 Drifty「导入」页面以“采集快照”方式导入。完整说明见 [`docs/readonly-schema-export.md`](docs/readonly-schema-export.md)。旧的 `scripts/export_mes_schema.py` 入口仍兼容默认 `mes_` 前缀用法。

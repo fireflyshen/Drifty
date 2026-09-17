@@ -1,6 +1,7 @@
 import { clean, hash, id, now, runChunked, validateScopeSelection } from "@/server/catalog/shared";
 import { latestSnapshotObjects } from "@/server/catalog/snapshots";
 import type { CatalogActionContext } from "@/server/catalog/actions/context";
+import { buildFieldAlignmentPlan } from "@/server/catalog/diff/field-alignment";
 
 /**
  * 处理历史、SQL 登记和范围比较命令。
@@ -770,6 +771,7 @@ export async function handleHistoryAction({
       }),
       {} as Record<string, number>,
     );
+    const alignment = buildFieldAlignmentPlan(baseFields, targetFields);
     return Response.json({
       ok: true,
       items,
@@ -780,6 +782,9 @@ export async function handleHistoryAction({
       targetTablePresent,
       indexItems,
       constraintItems,
+      alignmentSql: alignment.sql,
+      alignmentItems: alignment.items,
+      alignmentSummary: alignment.summary,
       baseSnapshot: baseSnapshot?.snapshot ?? null,
       targetSnapshot: targetSnapshot?.snapshot ?? null,
     });

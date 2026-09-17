@@ -50,6 +50,9 @@ try {
   const customerTableBeforeChanges=tableSearchBeforeChanges.tables.find(table=>table.name==='drifty_smoke_customer');
   const snapshotDiff=await request('scope.compare',{base:{projectId,versionId,environmentId},target:{projectId,versionId,environmentId:peerEnvironmentId},tableId:customerTableBeforeChanges.id});
   assert.equal(snapshotDiff.items.some(item=>item.columnName==='name'&&item.result==='modified'),true);
+  assert.deepEqual(snapshotDiff.alignmentSummary,{added:0,modified:1,dropped:0});
+  assert.deepEqual(snapshotDiff.alignmentItems.map(item=>[item.action,item.destructive]),[['modify',false]]);
+  assert.equal(snapshotDiff.alignmentSql,'ALTER TABLE `drifty_smoke_customer` MODIFY COLUMN `name` varchar(80) NULL;');
 
   const added=await request('import.sql',{name:'添加字段',sql:'ALTER TABLE drifty_smoke_customer ADD COLUMN region varchar(40);',importMode:'executed',sourceKind:'paste',projectId,versionId,environmentIds:[environmentId]});
   assert.equal(added.added,1);
